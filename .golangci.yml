@@ -1,0 +1,108 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - contextcheck
+    - copyloopvar
+    - dupword
+    - durationcheck
+    - errchkjson
+    - errname
+    - errorlint
+    - exhaustive
+    - fatcontext
+    - forcetypeassert
+    - gocheckcompilerdirectives
+    - gocritic
+    - godot
+    - gosec
+    - iface
+    - intrange
+    - mirror
+    - misspell
+    - nakedret
+    - nilerr
+    - nilnil
+    - noctx
+    - nolintlint
+    - perfsprint
+    - prealloc
+    - predeclared
+    - reassign
+    - recvcheck
+    - revive
+    - sloglint
+    - testableexamples
+    - thelper
+    - tparallel
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - whitespace
+  settings:
+    errcheck:
+      check-type-assertions: true
+    exhaustive:
+      default-signifies-exhaustive: true
+    gocritic:
+      enabled-tags: [diagnostic, style, performance]
+      disabled-checks:
+        - hugeParam # Config is passed by value once, at construction
+        - unnamedResult
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # readability of structs over a few bytes
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    revive:
+      rules:
+        - name: exported
+          arguments: [checkPrivateReceivers, sayRepetitiveInsteadOfStutters]
+        - name: package-comments
+        - name: var-naming
+        - name: receiver-naming
+        - name: indent-error-flow
+        - name: error-strings
+        - name: error-return
+        - name: errorf
+        - name: context-as-argument
+        - name: unused-parameter
+        - name: unexported-return
+        - name: superfluous-else
+        - name: early-return
+    sloglint:
+      kv-only: true
+      context: scope
+  exclusions:
+    generated: strict
+    presets: [std-error-handling]
+    rules:
+      # Tests deliberately ignore some errors and use type assertions on
+      # values they constructed themselves.
+      - path: _test\.go
+        linters: [forcetypeassert, gosec, errcheck, noctx]
+      # The conformance suite's test* functions are subtest bodies, not
+      # helpers: calling t.Helper() there would hide the failing line.
+      - path: storetest/storetest\.go
+        linters: [thelper]
+        text: "should start from t.Helper"
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes: [github.com/aozmekik/go-idempotency]
