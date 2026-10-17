@@ -98,6 +98,10 @@ linters:
       - path: storetest/storetest\.go
         linters: [thelper]
         text: "should start from t.Helper"
+      # These examples need a live Redis or PostgreSQL server, so they are
+      # compiled (and so kept correct) but deliberately not run.
+      - path: (redisstore|pgstore)/example_test\.go
+        linters: [testableexamples]
 
 formatters:
   enable:
