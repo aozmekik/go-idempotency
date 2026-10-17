@@ -31,7 +31,7 @@ var shared struct {
 	err  error
 }
 
-func testPool(t *testing.T) *pgxpool.Pool {
+func testPool(t testing.TB) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("IDEMPOTENCY_TEST_PG_DSN")
 	if dsn == "" {
