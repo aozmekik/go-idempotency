@@ -104,7 +104,9 @@ func (r *recorder) result() (resp *Response, replayable bool) {
 		r.status = http.StatusOK
 		r.header = r.snapshot()
 	}
-	return &Response{StatusCode: r.status, Header: r.header, Body: bytes.Clone(r.body.Bytes())}, true
+	// The recorder is discarded after this call, so its buffer can be
+	// handed over without copying.
+	return &Response{StatusCode: r.status, Header: r.header, Body: r.body.Bytes()}, true
 }
 
 // snapshot copies the allowlisted headers, minus any the response itself

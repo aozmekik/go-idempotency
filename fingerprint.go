@@ -3,8 +3,6 @@ package idempotency
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"hash"
-	"io"
 	"net/http"
 )
 
@@ -18,32 +16,28 @@ const fingerprintVersion = "go-idempotency/fingerprint/v1"
 // canonical and sorted) and the SHA-256 of the body.
 func fingerprint(r *http.Request, headers []string, body []byte) Fingerprint {
 	bodySum := sha256.Sum256(body)
-	h := sha256.New()
-	writeField(h, fingerprintVersion)
-	writeField(h, r.Method)
-	writeField(h, r.URL.EscapedPath())
-	writeField(h, r.URL.RawQuery)
-	writeUvarint(h, uint64(len(headers)))
+	// Typical requests fit the fixed-size buffer, which stays on the stack.
+	buf := make([]byte, 0, 512)
+	buf = appendField(buf, fingerprintVersion)
+	buf = appendField(buf, r.Method)
+	buf = appendField(buf, r.URL.EscapedPath())
+	buf = appendField(buf, r.URL.RawQuery)
+	buf = binary.AppendUvarint(buf, uint64(len(headers)))
 	for _, name := range headers {
 		values := r.Header.Values(name)
-		writeField(h, name)
-		writeUvarint(h, uint64(len(values)))
+		buf = appendField(buf, name)
+		buf = binary.AppendUvarint(buf, uint64(len(values)))
 		for _, v := range values {
-			writeField(h, v)
+			buf = appendField(buf, v)
 		}
 	}
-	writeField(h, string(bodySum[:]))
-	var fp Fingerprint
-	h.Sum(fp[:0])
-	return fp
+	buf = binary.AppendUvarint(buf, uint64(len(bodySum)))
+	buf = append(buf, bodySum[:]...)
+	return sha256.Sum256(buf)
 }
 
-func writeField(h hash.Hash, s string) {
-	writeUvarint(h, uint64(len(s)))
-	_, _ = io.WriteString(h, s) // hash.Hash.Write never returns an error
-}
-
-func writeUvarint(h hash.Hash, n uint64) {
-	var buf [binary.MaxVarintLen64]byte
-	_, _ = h.Write(binary.AppendUvarint(buf[:0], n))
+// appendField appends s with a uvarint length prefix.
+func appendField(buf []byte, s string) []byte {
+	buf = binary.AppendUvarint(buf, uint64(len(s)))
+	return append(buf, s...)
 }

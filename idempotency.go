@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -331,11 +330,19 @@ func storageKey(scope, key string) string {
 	return strconv.QuoteToASCII(scope) + ":" + key
 }
 
+// readBody reads the whole body, failing with *http.MaxBytesError beyond
+// limit. A declared Content-Length within the limit sizes the buffer up
+// front, so typical bodies are read without regrowing it.
 func readBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
 	if r.Body == nil || r.Body == http.NoBody {
 		return nil, nil
 	}
-	return io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	var buf bytes.Buffer
+	if r.ContentLength > 0 && r.ContentLength <= limit {
+		buf.Grow(int(r.ContentLength) + bytes.MinRead)
+	}
+	_, err := buf.ReadFrom(http.MaxBytesReader(w, r.Body, limit))
+	return buf.Bytes(), err
 }
 
 func (m *Middleware) serveExisting(w http.ResponseWriter, r *http.Request, rec Record, fp Fingerprint) {
@@ -442,37 +449,56 @@ func (m *Middleware) renderProblem(r *http.Request, slug, detail string) *Respon
 // keepAlive renews the lease every Lease/3 until the returned stop function
 // is called. stop reports whether the lock was lost, in which case the
 // record must not be completed or released by this request.
+//
+// Renewal runs on a timer rather than a dedicated goroutine: most handlers
+// finish before the first renewal is due, so they never pay for one.
 func (m *Middleware) keepAlive(ctx context.Context, key, token string) (stop func() (lost bool)) {
-	interval := m.cfg.Lease / 3
-	done := make(chan struct{})
-	var lost atomic.Bool
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-			}
-			extendCtx, cancel := context.WithTimeout(ctx, interval)
-			err := m.cfg.Store.Extend(extendCtx, key, token, m.cfg.Lease)
-			cancel()
-			if errors.Is(err, ErrLockLost) {
-				lost.Store(true)
-				return
-			}
-			if err != nil {
-				m.cfg.Logger.WarnContext(ctx, "idempotency: renewing lease failed; will retry", "error", err)
-			}
-		}
-	})
-	var once sync.Once
-	return func() bool {
-		once.Do(func() { close(done); wg.Wait() })
-		return lost.Load()
+	k := &leaseKeeper{m: m, ctx: ctx, key: key, token: token, interval: m.cfg.Lease / 3}
+	k.mu.Lock()
+	k.timer = time.AfterFunc(k.interval, k.renew)
+	k.mu.Unlock()
+	return k.stop
+}
+
+// leaseKeeper renews one in-flight lock. Its mutex is held for the whole
+// renewal, so stop waits for a renewal in progress and none starts after it.
+type leaseKeeper struct {
+	m          *Middleware
+	ctx        context.Context // detached from the request; lives exactly as long as the lock
+	key, token string
+	interval   time.Duration
+
+	mu      sync.Mutex
+	timer   *time.Timer
+	stopped bool
+	lost    bool
+}
+
+func (k *leaseKeeper) renew() {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.stopped {
+		return
 	}
+	ctx, cancel := context.WithTimeout(k.ctx, k.interval)
+	err := k.m.cfg.Store.Extend(ctx, k.key, k.token, k.m.cfg.Lease)
+	cancel()
+	switch {
+	case errors.Is(err, ErrLockLost):
+		k.lost = true
+		return
+	case err != nil:
+		k.m.cfg.Logger.WarnContext(k.ctx, "idempotency: renewing lease failed; will retry", "error", err)
+	}
+	k.timer.Reset(k.interval)
+}
+
+func (k *leaseKeeper) stop() bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.stopped = true
+	k.timer.Stop()
+	return k.lost
 }
 
 // isToken reports whether s is a non-empty RFC 9110 token.
