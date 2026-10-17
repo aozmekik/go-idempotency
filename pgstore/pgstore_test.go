@@ -31,11 +31,11 @@ var shared struct {
 	err  error
 }
 
-func testPool(t testing.TB) *pgxpool.Pool {
-	t.Helper()
+func testPool(tb testing.TB) *pgxpool.Pool {
+	tb.Helper()
 	dsn := os.Getenv("IDEMPOTENCY_TEST_PG_DSN")
 	if dsn == "" {
-		t.Skip("IDEMPOTENCY_TEST_PG_DSN not set; skipping PostgreSQL integration tests")
+		tb.Skip("IDEMPOTENCY_TEST_PG_DSN not set; skipping PostgreSQL integration tests")
 	}
 	shared.once.Do(func() {
 		ctx := context.Background()
@@ -45,7 +45,7 @@ func testPool(t testing.TB) *pgxpool.Pool {
 		}
 	})
 	if shared.err != nil {
-		t.Fatalf("connecting to PostgreSQL: %v", shared.err)
+		tb.Fatalf("connecting to PostgreSQL: %v", shared.err)
 	}
 	return shared.pool
 }
