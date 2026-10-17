@@ -23,6 +23,7 @@ const (
 	ProblemBodyUnreadable        = "body-unreadable"
 	ProblemStoreUnavailable      = "store-unavailable"
 	ProblemResponseNotReplayable = "response-not-replayable"
+	ProblemRequestFailed         = "request-failed"
 )
 
 // Problem is an RFC 9457 problem details object.
@@ -70,6 +71,7 @@ var problemTitles = map[string]struct {
 	ProblemBodyUnreadable:        {http.StatusBadRequest, "Request body could not be read"},
 	ProblemStoreUnavailable:      {http.StatusServiceUnavailable, "Idempotency store unavailable"},
 	ProblemResponseNotReplayable: {http.StatusInternalServerError, "Original response cannot be replayed"},
+	ProblemRequestFailed:         {http.StatusInternalServerError, "Original request failed"},
 }
 
 func (m *Middleware) problem(w http.ResponseWriter, r *http.Request, slug, detail string) {

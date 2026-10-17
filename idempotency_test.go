@@ -643,6 +643,24 @@ func TestPanickingHandlerReleasesKey(t *testing.T) {
 	}
 }
 
+func TestPanicIsStoredWhenPolicyStoresServerErrors(t *testing.T) {
+	t.Parallel()
+	h := &counter{h: func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) }}
+	mw := newMiddleware(t, idempotency.Config{ShouldStore: func(int) bool { return true }}).Handler(h)
+	func() {
+		defer func() { _ = recover() }()
+		serve(mw, request{key: testKey})
+	}()
+	w := serve(mw, request{key: testKey})
+	wantProblem(t, w, http.StatusInternalServerError, idempotency.ProblemRequestFailed)
+	if w.Header().Get(idempotency.ReplayedHeader) != "true" {
+		t.Error("stored failure is not marked as replayed")
+	}
+	if h.Calls() != 1 {
+		t.Errorf("handler ran %d times, want 1 (at-most-once policy)", h.Calls())
+	}
+}
+
 func TestScopesAreIsolated(t *testing.T) {
 	t.Parallel()
 	h := &counter{h: func(w http.ResponseWriter, r *http.Request) {

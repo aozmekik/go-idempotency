@@ -109,7 +109,10 @@ type Config struct {
 
 	// ShouldStore decides from the final status code whether a response is
 	// stored for replay. When it returns false, the key is released and a
-	// retry runs the handler again. Default: [DefaultShouldStore].
+	// retry runs the handler again. A handler that panics counts as a 500:
+	// if ShouldStore(500) is true, later requests with the key get a stored
+	// 500 problem (request-failed) instead of running the handler again.
+	// Default: [DefaultShouldStore].
 	ShouldStore func(statusCode int) bool
 
 	// ReplayHeaders lists the response headers that are stored and replayed.
@@ -393,11 +396,18 @@ func (m *Middleware) run(w http.ResponseWriter, r *http.Request, next http.Handl
 		if finished {
 			return
 		}
-		// The handler panicked or called runtime.Goexit. Free the key so a
-		// retry can run, then let the panic continue to net/http.
-		if lost := stop(); !lost {
-			m.release(ctx, key, token)
+		// The handler panicked or called runtime.Goexit, so the client gets
+		// no response and the outcome is unknown. Treat it as a 500 for the
+		// storage policy, then let the panic continue to net/http.
+		if lost := stop(); lost {
+			return
 		}
+		if m.cfg.ShouldStore(http.StatusInternalServerError) {
+			m.complete(ctx, key, token, m.renderProblem(r, ProblemRequestFailed,
+				"The original request failed with an internal error and its outcome is unknown. Use a new key only if you intend to repeat it."))
+			return
+		}
+		m.release(ctx, key, token)
 	}()
 	next.ServeHTTP(rec, r)
 	finished = true
