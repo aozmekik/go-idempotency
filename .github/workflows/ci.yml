@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", redisstore, pgstore]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: "**/go.sum"
+      - name: Check that go.mod and go.sum are tidy
+        working-directory: ${{ matrix.module }}
+        run: go mod tidy -diff
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+          working-directory: ${{ matrix.module }}
+
+  test:
+    name: Test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [oldstable, stable]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.2-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      IDEMPOTENCY_TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      IDEMPOTENCY_TEST_REDIS_ADDR: localhost:6379
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: "**/go.sum"
+      - name: Build all modules
+        run: |
+          go build ./...
+          (cd redisstore && go build ./...)
+          (cd pgstore && go build ./...)
+      - name: Test core module
+        run: go test -race -shuffle=on -count=1 ./...
+      - name: Test redisstore (miniredis and Redis 7.2)
+        working-directory: redisstore
+        run: go test -race -shuffle=on -count=1 ./...
+      - name: Test pgstore (PostgreSQL 16)
+        working-directory: pgstore
+        run: go test -race -shuffle=on -count=1 ./...
+
+  conformance:
+    name: Structured Field test vectors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: httpwg/structured-field-tests
+          ref: 781ba38464b2ec4c547e1e14d007d4f5ace7457e
+          path: structured-field-tests
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: "**/go.sum"
+      - name: Run RFC 9651 item vectors
+        env:
+          SFV_TEST_VECTORS: ${{ github.workspace }}/structured-field-tests
+        run: go test -count=1 -run TestVectors -v ./internal/sfv
+
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: FuzzParseItem
+            package: ./internal/sfv
+          - target: FuzzParseKey
+            package: .
+          - target: FuzzFormatKey
+            package: .
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: "**/go.sum"
+      - name: Fuzz for 60 seconds
+        run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 60s ${{ matrix.package }}

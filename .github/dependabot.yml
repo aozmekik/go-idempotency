@@ -1,0 +1,20 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directories: ["/", "/redisstore", "/pgstore"]
+    schedule:
+      interval: weekly
+    ignore:
+      # The store modules build against the core module in this repository
+      # through a replace directive; it is released together with them.
+      - dependency-name: github.com/aozmekik/go-idempotency
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
