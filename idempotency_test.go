@@ -736,6 +736,19 @@ func TestInformationalResponsesAreNotTheResult(t *testing.T) {
 	wantReplay(t, serve(mw, request{key: testKey}), http.StatusAccepted, "queued")
 }
 
+func TestSuperfluousWriteHeaderKeepsFirstStatus(t *testing.T) {
+	t.Parallel()
+	mw := newMiddleware(t, idempotency.Config{}).Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		w.WriteHeader(http.StatusTeapot) // ignored by net/http, and by the recorder
+		_, _ = w.Write([]byte("ok"))
+	}))
+	if w := serve(mw, request{key: testKey}); w.Code != http.StatusAccepted {
+		t.Fatalf("original status %d, want 202", w.Code)
+	}
+	wantReplay(t, serve(mw, request{key: testKey}), http.StatusAccepted, "ok")
+}
+
 func TestHeadersChangedAfterWriteHeaderAreNotStored(t *testing.T) {
 	t.Parallel()
 	mw := newMiddleware(t, idempotency.Config{}).Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -828,6 +841,33 @@ func TestHijackedResponseReleasesKey(t *testing.T) {
 	}
 	if calls.Load() != 2 {
 		t.Errorf("handler ran %d times, want 2 (hijacked responses are not stored)", calls.Load())
+	}
+}
+
+func TestResponseControllerReachesUnderlyingWriter(t *testing.T) {
+	t.Parallel()
+	mw := newMiddleware(t, idempotency.Config{}).Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Deadlines are not implemented by the recorder itself; the
+		// ResponseController must find them through Unwrap.
+		if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(time.Minute)); err != nil {
+			t.Errorf("SetWriteDeadline through the middleware: %v", err)
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	srv := httptest.NewServer(mw)
+	t.Cleanup(srv.Close)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(idempotency.DefaultHeaderName, testKey)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status %d", resp.StatusCode)
 	}
 }
 
