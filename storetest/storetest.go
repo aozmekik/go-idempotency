@@ -212,6 +212,14 @@ func testResponseRoundTrip(t *testing.T, s idempotency.Store, _ func(time.Durati
 		"clientError":  {StatusCode: http.StatusBadRequest, Body: []byte(`{"error":"bad"}`)},
 		"manyHeaders":  {StatusCode: http.StatusAccepted, Header: http.Header{"A": {"1"}, "B": {"2", "3"}, "C": {""}}},
 		"utf8AndSpace": {StatusCode: http.StatusOK, Body: []byte("  ünïcödé\n\t ")},
+		// Field values are bytes, not text: HTTP allows obs-text (0x80-0xFF)
+		// and net/http sends control bytes through unchanged. A store that
+		// keeps values as JSON strings or PostgreSQL text alters them.
+		"headerBytes": {StatusCode: http.StatusOK, Header: http.Header{
+			"Content-Disposition": {"attachment; filename=\"r\xe9sum\xe9.pdf\""}, // Latin-1, not valid UTF-8
+			"X-Control":           {"a\x00b", "\x01\x7f\t", "\xff\xfe"},
+			"X-Utf8":              {"ünïcödé ✓"},
+		}},
 	}
 	for name, want := range cases {
 		k := key + "/" + name

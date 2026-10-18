@@ -88,7 +88,9 @@ type Acquisition struct {
 //
 // Keys passed by [Middleware] consist of printable ASCII (0x20-0x7E): the
 // client's key prefixed with the quoted scope. Tokens are random base32
-// strings.
+// strings. Response header names are canonical RFC 9110 tokens, but header
+// values and bodies are arbitrary bytes, which need not be valid UTF-8 and
+// may contain NUL; they must come back exactly as stored.
 //
 // The storetest package provides a conformance suite for implementations.
 type Store interface {

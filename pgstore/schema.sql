@@ -3,7 +3,9 @@
 -- One row per idempotency key. A row is in flight while lock_token is set
 -- and completed once status_code is set; the CHECK constraint keeps the two
 -- states exclusive. Rows whose expires_at has passed are treated as absent
--- and are removed by Store.DeleteExpired.
+-- and are removed by Store.DeleteExpired. header maps each replayed header
+-- name to its values in base64, because field values are bytes that need not
+-- be valid UTF-8 (and jsonb cannot hold NUL).
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key         text        PRIMARY KEY,

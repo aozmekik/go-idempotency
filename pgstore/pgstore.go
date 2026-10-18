@@ -192,7 +192,7 @@ func (s *Store) load(ctx context.Context, key string) (rec idempotency.Record, f
 	}
 	var h http.Header
 	if len(header) > 0 {
-		if err := json.Unmarshal(header, &h); err != nil {
+		if h, err = decodeHeader(header); err != nil {
 			return idempotency.Record{}, false, fmt.Errorf("pgstore: acquire: key %q: decoding headers: %w", key, err)
 		}
 	}
@@ -208,7 +208,7 @@ func (s *Store) Extend(ctx context.Context, key, token string, lease time.Durati
 
 // Complete implements [idempotency.Store].
 func (s *Store) Complete(ctx context.Context, key, token string, resp *idempotency.Response, ttl time.Duration) error {
-	header, err := json.Marshal(resp.Header)
+	header, err := encodeHeader(resp.Header)
 	if err != nil {
 		return fmt.Errorf("pgstore: complete: encoding headers: %w", err)
 	}
@@ -245,4 +245,39 @@ func (s *Store) DeleteExpired(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("pgstore: delete expired: %w", err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// encodeHeader serializes h as a JSON object that maps each field name to
+// its values, base64-encoded (encoding/json's encoding of []byte). Values are
+// bytes, not text: HTTP allows obs-text (0x80-0xFF) in field values and
+// net/http sends control bytes through, but a JSON string would replace
+// invalid UTF-8 with U+FFFD, and jsonb rejects \u0000 outright. Names are
+// tokens, so they are plain ASCII and stay readable in the header column.
+func encodeHeader(h http.Header) ([]byte, error) {
+	raw := make(map[string][][]byte, len(h))
+	for name, values := range h {
+		vs := make([][]byte, len(values))
+		for i, v := range values {
+			vs[i] = []byte(v)
+		}
+		raw[name] = vs
+	}
+	return json.Marshal(raw)
+}
+
+// decodeHeader reverses encodeHeader.
+func decodeHeader(data []byte) (http.Header, error) {
+	var raw map[string][][]byte
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	h := make(http.Header, len(raw))
+	for name, values := range raw {
+		vs := make([]string, len(values))
+		for i, v := range values {
+			vs[i] = string(v)
+		}
+		h[name] = vs
+	}
+	return h, nil
 }

@@ -32,7 +32,7 @@ const DefaultPrefix = "idempotency:"
 //	f  request fingerprint, 32 raw bytes
 //	t  lock token; present only while in flight
 //	c  status code
-//	h  replayable headers, JSON object of string arrays
+//	h  replayable headers, JSON object of arrays of base64 values (encodeHeader)
 //	b  body
 var (
 	// acquireScript returns the existing record as {s, f, c, h, b}, or nil
@@ -132,7 +132,7 @@ func (s *Store) Extend(ctx context.Context, key, token string, lease time.Durati
 
 // Complete implements [idempotency.Store].
 func (s *Store) Complete(ctx context.Context, key, token string, resp *idempotency.Response, ttl time.Duration) error {
-	header, err := json.Marshal(resp.Header)
+	header, err := encodeHeader(resp.Header)
 	if err != nil {
 		return fmt.Errorf("redisstore: complete: encoding headers: %w", err)
 	}
@@ -196,11 +196,45 @@ func decodeRecord(reply []any) (idempotency.Record, error) {
 		return idempotency.Record{}, fmt.Errorf("%w: bad status %q", errCorrupt, statusText)
 	}
 	headerJSON, _ := field(3)
-	var header http.Header
-	if err := json.Unmarshal([]byte(headerJSON), &header); err != nil {
+	header, err := decodeHeader([]byte(headerJSON))
+	if err != nil {
 		return idempotency.Record{}, fmt.Errorf("%w: bad headers: %w", errCorrupt, err)
 	}
 	body, _ := field(4)
 	rec.Response = &idempotency.Response{StatusCode: status, Header: header, Body: []byte(body)}
 	return rec, nil
+}
+
+// encodeHeader serializes h as a JSON object that maps each field name to
+// its values, base64-encoded (encoding/json's encoding of []byte). Values are
+// bytes, not text: HTTP allows obs-text (0x80-0xFF) in field values and
+// net/http sends control bytes through, but a JSON string would replace
+// invalid UTF-8 with U+FFFD. Names are tokens, so they are plain ASCII.
+func encodeHeader(h http.Header) ([]byte, error) {
+	raw := make(map[string][][]byte, len(h))
+	for name, values := range h {
+		vs := make([][]byte, len(values))
+		for i, v := range values {
+			vs[i] = []byte(v)
+		}
+		raw[name] = vs
+	}
+	return json.Marshal(raw)
+}
+
+// decodeHeader reverses encodeHeader.
+func decodeHeader(data []byte) (http.Header, error) {
+	var raw map[string][][]byte
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	h := make(http.Header, len(raw))
+	for name, values := range raw {
+		vs := make([]string, len(values))
+		for i, v := range values {
+			vs[i] = string(v)
+		}
+		h[name] = vs
+	}
+	return h, nil
 }
