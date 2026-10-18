@@ -34,19 +34,25 @@ group draft for status codes and header syntax, and documents where it deviates.
 - **Strict key syntax.** The key is parsed as an [RFC 9651](https://www.rfc-editor.org/rfc/rfc9651)
   Structured Field String by a complete Item parser. It passes all 847 item test vectors of the HTTP
   WG [structured-field-tests](https://github.com/httpwg/structured-field-tests) suite.
-- **Request fingerprinting.** SHA-256 over method, path, query, selected headers and the body hash,
-  with an unambiguous length-prefixed encoding ([ADR 0001](docs/adr/0001-fingerprint-and-lock-semantics.md)).
+- **Request fingerprinting.** SHA-256 over method, host, path, query, selected headers and the body
+  hash, with an unambiguous length-prefixed encoding
+  ([ADR 0001](docs/adr/0001-fingerprint-and-lock-semantics.md)) checked against an independent
+  Python implementation.
 - **Crash-safe locking.** Each in-flight claim carries a fencing token and a lease that is renewed
-  while the handler runs, so a dead process blocks a key for at most one lease and a stale one
-  cannot overwrite its successor.
+  while the handler runs. Failed renewals are retried against the lease deadline, so a store outage
+  that ends shortly before the lease runs out does not lose it. A dead process blocks a key for at
+  most one lease, a stale one cannot overwrite its successor, and every store call is bounded by the
+  lease.
 - **Safe replay.** Headers are allowlisted. `Set-Cookie` is excluded unless you list it, hop-by-hop
-  headers are rejected, and 5xx responses are not stored by default, so clients can retry them.
+  headers are rejected, and by default server errors and "not now" or credential errors (401, 403,
+  408, 409, 423, 425, 429) are not stored, so clients can retry them.
 - **Per-caller scopes.** Keys from different accounts never interact.
 - **Three stores** behind one interface, all checked by one exported conformance suite
   (`storetest`):
   - `memstore`: sharded map with TTL cleanup, in the core module;
   - `redisstore`: go-redis v9, one Lua script per operation;
-  - `pgstore`: pgx v5, `INSERT ... ON CONFLICT`.
+  - `pgstore`: pgx v5, `INSERT ... ON CONFLICT`, with a `Migrate` that is safe to run from every
+    instance at startup.
 - **No dependencies in the core module.** The Redis and PostgreSQL stores are separate modules
   ([ADR 0002](docs/adr/0002-store-modules.md)).
 
@@ -80,12 +86,7 @@ import (
 )
 
 func main() {
-	idem, err := idempotency.New(idempotency.Config{
-		Store: memstore.New(),
-		// Give every caller its own key space. Use the identity your
-		// authentication middleware established, not a raw header.
-		Scope: func(r *http.Request) string { return r.Header.Get("X-Account-ID") },
-	})
+	idem, err := idempotency.New(idempotency.Config{Store: memstore.New()})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -93,6 +94,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("POST /payments", idem.Handler(http.HandlerFunc(createPayment)))
 
+	// With more than one caller, put authentication in front of the
+	// middleware and set Config.Scope: see "Scope" below.
 	srv := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }
@@ -101,7 +104,7 @@ func createPayment(w http.ResponseWriter, r *http.Request) {
 	// Runs once per key, however often the client retries.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte(`{"id":"pay_1"}`))
+	_, _ = w.Write([]byte(`{"id":"pay_1"}`))
 }
 ```
 
@@ -113,8 +116,8 @@ curl -X POST localhost:8080/payments \
   -d '{"amount":1999,"currency":"EUR"}'
 ```
 
-[`examples/payments`](examples/payments) is a runnable API with a captured curl walkthrough of every
-case: replay, 422, 409, 400 and per-account scoping.
+[`examples/payments`](examples/payments) is a runnable API with a curl walkthrough captured from a
+real run: replay, 422, 409, the two kinds of 400, and the same key sent from another account.
 
 ## How it works
 
@@ -124,8 +127,8 @@ stateDiagram-v2
     [*] --> InFlight: first request (Acquire with lease)
     InFlight --> InFlight: lease renewed, duplicates get 409
     InFlight --> Completed: handler done and ShouldStore(status)
-    InFlight --> [*]: Release (5xx by default, hijack, panic)
-    InFlight --> [*]: lease expired (holder died)
+    InFlight --> [*]: Release (status not stored, hijack, panic)
+    InFlight --> [*]: lease expired (holder died or lost the store)
     Completed --> Completed: same fingerprint gets replay
     Completed --> [*]: TTL expired
 ```
@@ -140,10 +143,10 @@ fingerprint differs from the stored one gets 422 in either state.
 | No key, `KeyRequired` false | passed through without protection |
 | Key not a single quoted String, empty, or too long | `400` [`key-invalid`](docs/problems.md#key-invalid) |
 | Body over `MaxBodyBytes` | `413` [`body-too-large`](docs/problems.md#body-too-large) |
-| Store unreachable | `503` [`store-unavailable`](docs/problems.md#store-unavailable), handler not run |
+| Store unreachable | `503` [`store-unavailable`](docs/problems.md#store-unavailable) with `Retry-After: 1`, handler not run |
 | New key | handler runs; response stored if `ShouldStore(status)` |
 | Same key, different fingerprint | `422` [`key-reused`](docs/problems.md#key-reused) |
-| Same key and fingerprint, original running | `409` [`request-in-flight`](docs/problems.md#request-in-flight) |
+| Same key and fingerprint, original running | `409` [`request-in-flight`](docs/problems.md#request-in-flight) with `Retry-After: 1` |
 | Same key and fingerprint, original completed | stored response with `Idempotent-Replayed: true` |
 
 ## API overview
@@ -163,13 +166,13 @@ func FormatKey(key string) (string, error)              // client side: quote a 
 | `Methods` | POST, PATCH | methods the middleware applies to |
 | `KeyRequired` | always | per-request predicate; false lets keyless requests through |
 | `Scope` | one global scope | namespace per caller, for example the account ID |
-| `FingerprintHeaders` | none | request headers that are part of the fingerprint |
+| `FingerprintHeaders` | none | request headers that are part of the fingerprint (the host always is) |
 | `MaxKeyLength` | 255 bytes | longest accepted key |
 | `MaxBodyBytes` | 1 MiB | request bodies are buffered to be hashed |
 | `MaxResponseBytes` | 1 MiB | longest response captured for replay |
-| `Lease` | 30 s | in-flight lock lifetime without renewal |
+| `Lease` | 30 s | in-flight lock lifetime without renewal; renewed every `Lease/3` |
 | `TTL` | 24 h | how long responses are replayable |
-| `ShouldStore` | status < 500 | which responses are stored |
+| `ShouldStore` | all but 5xx, 401, 403, 408, 409, 423, 425, 429 | which responses are stored ([ADR 0003](docs/adr/0003-response-storage-policy.md)) |
 | `ReplayHeaders` | see [ADR 0003](docs/adr/0003-response-storage-policy.md) | response headers that are replayed |
 | `ProblemTypeBase`, `ProblemWriter` | this repo's docs, RFC 9457 JSON | error format |
 | `Logger` | `slog.Default()` | store failures and lost leases |
@@ -177,73 +180,92 @@ func FormatKey(key string) (string, error)              // client side: quote a 
 **Stores.** `memstore.New()` suits a single instance. Several instances need a shared store:
 
 ```go
-store := redisstore.New(redisClient)             // any redis.UniversalClient
-store := pgstore.New(pgxPool)                    // apply pgstore.Schema or call store.Migrate(ctx)
+redisStore := redisstore.New(redisClient) // any redis.UniversalClient
+pgStore := pgstore.New(pgxPool)           // then pgStore.Migrate(ctx), or apply pgstore.Schema yourself
 ```
 
 Expiry uses the Redis server's TTLs or PostgreSQL's `now()`, so application servers with skewed
-clocks still agree. `pgstore` keeps expired rows invisible and removes them when you call
-`DeleteExpired`. A custom store implements the four-method `Store` interface and passes
-`storetest.Run`.
+clocks still agree. The Redis instance must use `maxmemory-policy noeviction`: every record has a
+TTL, so the other policies can evict in-flight locks and stored responses. A Redis failover can
+also lose recent records (see the [`redisstore` documentation](redisstore/redisstore.go)).
+`pgstore.Migrate` takes an advisory lock, so every instance can call it at startup. `pgstore`
+keeps expired rows invisible and removes them when you call `DeleteExpired`. A custom store
+implements the four-method `Store` interface and passes `storetest.Run`.
 
 **Scope.** Without `Scope`, keys are global: a caller who learns another caller's key could send the
 same request and receive that caller's stored response. The draft's security considerations
 (Section 5) recommend combining the client's key with attributes known only to the server. Set
-`Scope` to the authenticated identity whenever the API has more than one caller.
+`Scope` to the authenticated identity whenever the API has more than one caller, and read it from
+the request context that your authentication middleware fills, never from a header the client
+controls:
+
+```go
+idem, err := idempotency.New(idempotency.Config{
+	Store: store,
+	Scope: func(r *http.Request) string { return accountFrom(r.Context()) }, // set by authenticate
+})
+// ...
+handler := authenticate(idem.Handler(api)) // authentication runs first
+```
+
+`ExampleConfig_scope` and [`examples/payments`](examples/payments) show this end to end. Put rate
+limiting in front of the middleware too: rejections from either should not consume a key, although
+the default policy does not store 401, 403 or 429 in any case.
 
 ## Design notes and trade-offs
 
 - [ADR 0001: fingerprint and lock semantics](docs/adr/0001-fingerprint-and-lock-semantics.md).
-  The fingerprint covers method, path, query, opted-in headers and the body hash. Locks are leases
-  with renewal and fencing tokens. Why authentication is a scope rather than part of the
-  fingerprint, and why the result is at-most-once within a lease, not exactly-once.
+  The fingerprint covers method, host, path, query, opted-in headers and the body hash. Locks are
+  leases with deadline-aware renewal and fencing tokens, and every store call is bounded by the
+  lease. Why authentication is a scope rather than part of the fingerprint, and why the result is
+  at-most-once within a lease, not exactly-once.
 - [ADR 0002: Redis and PostgreSQL stores as nested modules](docs/adr/0002-store-modules.md).
 - [ADR 0003: what is stored, when, and what happens on failure](docs/adr/0003-response-storage-policy.md).
-  Write-through capture; 5xx not stored by default, which deviates from the draft on purpose;
-  panics count as 500; the store fails closed; oversized responses are never re-executed.
+  Write-through capture; 5xx and transient or credential 4xx not stored by default, which deviates
+  from the draft on purpose; panics count as 500; the store fails closed; oversized successes are
+  never re-executed.
 - [Problem types](docs/problems.md) documents every error response.
 
 ## Benchmarks
 
-Measured on an Apple M1 Pro (8 cores), 16 GB RAM, macOS 26, `go1.27.2 darwin/arm64`, while other
-heavy jobs shared the machine: the 1-minute load average was 9.5 to 10 during the middleware run
-and about 7.5 during the store runs. Each figure is the median of 10 runs, with the range in
-parentheses. Expect noise. The results are only meaningful relative to each other on this machine.
-
-**Middleware overhead** (memory store, no network). Command:
+Measured on an Apple M1 Pro (8 cores), 16 GB RAM, macOS 26, `go1.27.2 darwin/arm64`, at commit
+`14dde29`, in a fresh clone, while other heavy jobs shared the machine: the 1-minute load average
+was 9.5 when the run started and when it ended. Command:
 `go test -run '^$' -bench . -benchmem -count=10 -benchtime=1s .`
 
-| Benchmark | ns/op | B/op | allocs/op |
+The benchmarks call `ServeHTTP` directly with `httptest.ResponseRecorder` and the memory store, so
+they measure the middleware's CPU and allocation cost, not networking. allocs/op and B/op were the
+same in all 10 runs (B/op to within 3 bytes) and are the reliable columns. ns/op is the median of
+the 10 runs with the range in parentheses. On a machine this loaded it moves a lot between runs:
+the same command, run a few minutes earlier on the previous commit (whose replay path is
+identical), gave a `Replay` median of 2522 ns instead of 3493 ns. Treat it as an order of
+magnitude.
+
+| Benchmark | allocs/op | B/op | ns/op |
 | --- | --- | --- | --- |
-| `BareHandler` (handler alone, baseline) | 768 (694 to 1940) | 1856 | 16 |
-| `FirstRequest/body=256` | 4297 (4130 to 5423) | 5326 | 51 |
-| `FirstRequest/body=16384` | 12975 (12668 to 14157) | 22990 | 51 |
-| `Replay` (handler not run) | 2275 (2129 to 2610) | 3384 | 30 |
-| `ParseKey` (UUID key) | 161 (157 to 178) | 120 | 4 |
+| `BareHandler` (handler alone, baseline) | 16 | 1856 | 724 (684 to 983) |
+| `FirstRequest/body=256` | 56 | 5478 | 5549 (5121 to 6305) |
+| `FirstRequest/body=16384` | 56 | 23142 | 15254 (13785 to 19120) |
+| `Replay` (handler not run) | 34 | 3656 | 3493 (2954 to 4323) |
+| `ParseKey` (UUID key) | 4 | 120 | 157 (154 to 160) |
 
-A request with a new key and a 256-byte body costs about 3.5 µs and 35 allocations more than the
+A request with a new key and a 256-byte body costs 40 allocations and roughly 5 µs more than the
 bare handler here: parse the key, buffer and hash the body, claim the key, capture the response and
-store it. The benchmarks call `ServeHTTP` directly with `httptest.ResponseRecorder`. They build
-requests without `httptest.NewRequest` (whose 4 KiB parse buffer would dominate) and reset the store
-every 10,000 requests, so heap growth does not depend on `-benchtime`. Parallel variants exist
-(`BenchmarkFirstRequestParallel`, `BenchmarkBareHandlerParallel`), but on a machine this loaded
-they did not scale and are not reported.
+store it. The requests are built without `httptest.NewRequest` (whose 4 KiB parse buffer would
+dominate), and the store is reset every 10,000 requests, so heap growth does not depend on
+`-benchtime`. The context deadline that bounds each store call accounts for 8 of those allocations
+(545 bytes) on a first request and 4 (272 bytes) on a replay: removing the two
+`context.WithTimeout` calls in a scratch copy of this commit and running
+`go test -run '^$' -bench 'FirstRequest/body=256|Replay' -benchmem -count=1 -benchtime=20000x .`
+gave 48 and 30 allocations. Parallel variants exist (`BenchmarkFirstRequestParallel`,
+`BenchmarkBareHandlerParallel`), but on a machine this loaded their timings say little, so they
+are not reported.
 
-**Store round trips** against real local servers over loopback TCP on the same laptop. The figure
-is one `Acquire` plus one `Complete`, the store work of a first request. Commands:
-`IDEMPOTENCY_TEST_REDIS_ADDR=127.0.0.1:6391 go test -run '^$' -bench AcquireComplete -benchmem -count=10 -benchtime=1s .`
-in `redisstore/`, and the same with `IDEMPOTENCY_TEST_PG_DSN=...` in `pgstore/`.
-
-| Store | µs per Acquire + Complete |
-| --- | --- |
-| Redis 7.2.7 | 249 (238 to 336) |
-| PostgreSQL 16.14 (`fsync=off` test instance) | 169 (137 to 191) |
-
-These figures mostly measure loopback round-trip latency on a busy laptop. `redis-benchmark -t ping_mbulk -c 1`
-reported p50 = 0.079 ms per round trip at the time. They are not a Redis-versus-PostgreSQL
-comparison or a production estimate: the PostgreSQL instance ran with `fsync=off`, and both servers
-shared CPUs with the benchmark and other jobs. There is deliberately no miniredis benchmark,
-because an in-process emulator says nothing about Redis performance.
+Store latency is not reported. On a shared laptop, `BenchmarkAcquireComplete` in `redisstore/` and
+`pgstore/` would mostly measure loopback round trips and scheduling, not the stores, and there is
+deliberately no miniredis benchmark, because an in-process emulator says nothing about Redis
+performance. Run them against your own servers: `IDEMPOTENCY_TEST_REDIS_ADDR=... go test -run '^$'
+-bench . -benchmem` in `redisstore/`, and the same with `IDEMPOTENCY_TEST_PG_DSN=...` in `pgstore/`.
 
 ## Testing
 
@@ -255,25 +277,35 @@ IDEMPOTENCY_TEST_PG_DSN=postgres://... go test -race ./...     # in pgstore/, re
 ```
 
 - `storetest.Run`: 17 conformance cases that every store passes. They cover lock-or-get, token
-  fencing, lease renewal and expiry, TTL expiry, and 32 concurrent `Acquire` calls of which exactly
-  one may win. Expiry cases use an injected clock (`memstore`, `pgstore`) or `miniredis.FastForward`.
+  fencing, lease renewal and expiry, TTL expiry, byte-exact header values (obs-text, control bytes,
+  NUL), and 32 concurrent `Acquire` calls of which exactly one may win. Expiry cases use an injected
+  clock (`memstore`, `pgstore`) or `miniredis.FastForward`.
 - Middleware tests are table-driven. They include 64 concurrent duplicates over real HTTP connections
   that must run the handler exactly once. Lease renewal and expiry run on a virtual clock
-  (`testing/synctest`) or an injected one; no test sleeps on wall time.
+  (`testing/synctest`) or an injected one, including store outages that hang or fail renewals until
+  shortly before the deadline; no test sleeps on wall time.
+- `pgstore` tests also run 10 rounds of 8 concurrent `Migrate` calls on a fresh schema and force
+  `Acquire`'s insert-then-select race with a wrapped connection.
 - Fuzz targets: `FuzzParseItem`, `FuzzParseKey` and `FuzzFormatKey`. CI fuzzes each for 60 s.
 - RFC 9651 conformance: `SFV_TEST_VECTORS=<checkout of httpwg/structured-field-tests> go test -run TestVectors ./internal/sfv`.
   CI runs it at a pinned commit.
 
-Statement coverage from `go test -cover` (Go 1.27.2, Apple M1 Pro). Real Redis 7.2.7 and PostgreSQL
-16.14 servers were running locally for the store modules:
+Statement coverage from `go test -count=1 -cover ./...` in each module (Go 1.27.2, Apple M1 Pro),
+with local Redis 7.2.7 and PostgreSQL 16.14 servers for the store modules
+(`IDEMPOTENCY_TEST_REDIS_ADDR`, `IDEMPOTENCY_TEST_PG_DSN`):
 
 | Package | Coverage |
 | --- | --- |
-| `idempotency` | 98.4% |
+| `idempotency` | 98.9% to 99.4% (see below) |
 | `internal/sfv` | 96.0% |
 | `memstore` | 100.0% |
-| `redisstore` | 96.4% |
-| `pgstore` | 86.4% (uncovered: corrupt-row branches the table's CHECK constraints prevent) |
+| `redisstore` | 97.3% |
+| `pgstore` | 96.4% |
+
+The core figure varies between runs because one branch only runs when a renewal timer fires just
+as the handler finishes. The remaining uncovered statements in the core and the stores are
+defensive: `json.Marshal` errors that cannot occur for the types involved, a reply shape the Lua
+script never returns, and corrupt rows that the PostgreSQL table's CHECK constraints prevent.
 
 ## Limitations and roadmap
 
@@ -281,11 +313,18 @@ Known limitations of v0.1.0:
 
 - **The key must be quoted.** The draft defines the value as an sf-string, so the bare
   `Idempotency-Key: 8e03978e-...` that many existing clients send is rejected with 400.
-- **At-most-once within a lease, not exactly-once.** If the store is unreachable for longer than a
-  lease while a handler runs, another instance can run it again (ADR 0001).
+- **At-most-once within a lease, not exactly-once.** If the store stays unreachable for almost a
+  whole lease while a handler runs, or the process stalls that long, another instance can run it
+  again (ADR 0001). The Redis store also needs `maxmemory-policy noeviction`, and a Redis failover
+  can lose recent locks and responses.
 - **Retries must be byte-identical.** The body is fingerprinted as bytes, not as parsed JSON.
+- **The host is compared as sent.** Case does not matter, but `example.com` and `example.com:443`
+  are different requests. The scheme is not part of the fingerprint, because behind a
+  TLS-terminating proxy the middleware cannot see it.
 - **Duplicates of an in-flight request get 409.** The server does not wait for the original.
 - **The store fails closed.** If it is unreachable, requests get 503.
+- **The first response waits for the store write.** It is delivered after `Complete` returns: one
+  round trip normally, and up to the remaining lease if the store stalls.
 - The draft is an expired working-group Internet-Draft (draft-07, 15 October 2025); its semantics
   may still change.
 - The Redis store uses one key per script, which is the requirement for Redis Cluster, but it has not
@@ -302,6 +341,8 @@ Roadmap, in no particular order:
   transaction, for exactly-once effects within one database;
 - a fail-open option;
 - an optional wait for in-flight originals instead of 409;
+- an optional `WAIT` for Redis replicas after each write, which narrows (but does not close) the
+  failover window;
 - metrics hooks;
 - a configurable table name;
 - an entry limit for `memstore`.
@@ -320,7 +361,9 @@ Roadmap, in no particular order:
   external conformance suite. It is not vendored.
 - Inspirations: Stripe's public documentation of idempotent requests, which is where the
   `Idempotent-Replayed` response header convention comes from; Martin Kleppmann's discussion of
-  fencing tokens in *How to do distributed locking* (2016). No code was taken from other projects.
+  fencing tokens in *How to do distributed locking* (2016), whose caveats about Redis-based locks
+  (timing assumptions, and locks lost when a replica takes over) are why `redisstore` documents
+  its deployment requirements. No code was taken from other projects.
 
 ## Contributing
 
