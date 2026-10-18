@@ -10,15 +10,20 @@ suggests linking error responses to documentation.
 ```json
 {
   "type": "https://github.com/aozmekik/go-idempotency/blob/main/docs/problems.md#key-reused",
-  "title": "Idempotency-Key reused with a different request",
+  "title": "Idempotency key reused with a different request",
   "status": 422,
-  "detail": "This key was already used for a request with a different method, path, query, headers or body. Use a new key for a new request."
+  "detail": "This key was already used for a request with a different method, host, path, query, headers or body. Use a new key for a new request."
 }
 ```
 
-Every problem response also carries `Cache-Control: no-store`. Replace the
-whole format with `Config.ProblemWriter` if your API has its own error
-envelope; `Problem.Slug` tells the writer which case it is handling.
+Every problem response also carries `Cache-Control: no-store`, and the two
+that ask the client to retry with the same key (`request-in-flight` and
+`store-unavailable`) carry `Retry-After: 1` as a hint. Titles name no header,
+so they stay correct when `Config.HeaderName` is customised; the `detail`
+names the configured header. Replace the whole format with
+`Config.ProblemWriter` if your API has its own error envelope; `Problem.Slug`
+tells the writer which case it is handling, and the `Retry-After` header is
+already set when it is called.
 
 | Slug | Status | Draft | Client should |
 | --- | --- | --- | --- |
@@ -56,15 +61,16 @@ Go clients can use `idempotency.FormatKey` to build the value.
 
 **422 Unprocessable Content.** The key was already used, within its retention
 period, for a request with a different fingerprint: a different method, path,
-query, selected header values (`Config.FingerprintHeaders`) or body. The
+host, query, selected header values (`Config.FingerprintHeaders`) or body. The
 handler did not run. This happens whether the earlier request is still in
 flight or has completed.
 
 ## request-in-flight
 
 **409 Conflict.** A request with this key and the same fingerprint is still
-being processed. The handler did not run. Retry later with the same key: once
-the original completes, the retry receives its stored response.
+being processed. The handler did not run. Retry later with the same key
+(`Retry-After` suggests one second): once the original completes, the retry
+receives its stored response.
 
 ## body-too-large
 
@@ -81,16 +87,18 @@ client disconnected mid-upload.
 
 **503 Service Unavailable.** The middleware could not reach its store to claim
 the key, so it did not run the handler: running it without the claim could
-execute the request twice. Retrying with the same key is safe. The cause is
-logged through `Config.Logger`.
+execute the request twice. Retrying with the same key is safe; `Retry-After`
+suggests one second. The cause is logged through `Config.Logger`.
 
 ## response-not-replayable
 
 **500 Internal Server Error** (stored and replayed with
-`Idempotent-Replayed: true`). The original request was processed, but its
-response body exceeded `Config.MaxResponseBytes` (1 MiB by default), so it was
-not stored. The handler is not run again for this key; the request's effect
-already happened.
+`Idempotent-Replayed: true`). The original request completed with a status
+below 400, which the detail names, but its response body exceeded
+`Config.MaxResponseBytes` (1 MiB by default), so it was not stored. The
+handler is not run again for this key; the request's effect already
+happened. An oversized error response (400 or above) is not stored at all,
+so a retry runs the handler again instead.
 
 ## request-failed
 

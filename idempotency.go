@@ -414,7 +414,7 @@ func readBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, erro
 func (m *Middleware) serveExisting(w http.ResponseWriter, r *http.Request, rec Record, fp Fingerprint) {
 	switch {
 	case rec.Fingerprint != fp:
-		m.problem(w, r, ProblemKeyReused, "This key was already used for a request with a different method, path, query, headers or body. Use a new key for a new request.")
+		m.problem(w, r, ProblemKeyReused, "This key was already used for a request with a different method, host, path, query, headers or body. Use a new key for a new request.")
 	case rec.State == StateInFlight:
 		m.problem(w, r, ProblemRequestInFlight, "The original request is still being processed. Retry later with the same key.")
 	case rec.Response == nil:

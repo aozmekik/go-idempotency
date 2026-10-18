@@ -78,10 +78,10 @@ $ curl -si -X POST localhost:18080/payments \
     -d '{"amount":2999,"currency":"EUR"}'
 HTTP/1.1 422 Unprocessable Entity
 Cache-Control: no-store
-Content-Length: 302
+Content-Length: 308
 Content-Type: application/problem+json
 
-{"type":"https://github.com/aozmekik/go-idempotency/blob/main/docs/problems.md#key-reused","title":"Idempotency key reused with a different request","status":422,"detail":"This key was already used for a request with a different method, path, query, headers or body. Use a new key for a new request."}
+{"type":"https://github.com/aozmekik/go-idempotency/blob/main/docs/problems.md#key-reused","title":"Idempotency key reused with a different request","status":422,"detail":"This key was already used for a request with a different method, host, path, query, headers or body. Use a new key for a new request."}
 ```
 
 ### 4. Send a duplicate while the original is still running
