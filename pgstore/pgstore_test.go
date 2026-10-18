@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	idempotency "github.com/aozmekik/go-idempotency"
@@ -209,6 +210,110 @@ func TestErrorsAreWrapped(t *testing.T) {
 	if err := s.Migrate(ctx); err == nil || !strings.HasPrefix(err.Error(), "pgstore: migrate:") {
 		t.Errorf("Migrate err = %v", err)
 	}
+}
+
+// TestCorruptHeaderIsReported stores a header document of the wrong shape,
+// which the table's constraints allow (it is valid JSON), and expects
+// Acquire to report it rather than replay a response without headers.
+func TestCorruptHeaderIsReported(t *testing.T) {
+	p := testPool(t)
+	t.Parallel()
+	key := "corrupt-header/" + rand.Text()
+	if _, err := p.Exec(t.Context(), `
+INSERT INTO idempotency_keys (key, fingerprint, status_code, header, body, expires_at)
+VALUES ($1, $2, 200, '{"Content-Type": "not an array"}', '', now() + interval '1 hour')`, key, make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := pgstore.New(p).Acquire(t.Context(), key, "tok", idempotency.Fingerprint{}, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "decoding headers") {
+		t.Fatalf("Acquire err = %v, want a header decoding error", err)
+	}
+}
+
+// racingDB runs hooks just before Acquire's two statements, to reproduce
+// what concurrent requests can do between them.
+type racingDB struct {
+	pgstore.DB
+	beforeInsert, beforeSelect func(ctx context.Context)
+}
+
+func (d *racingDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	switch {
+	case sql == pgstore.AcquireSQL && d.beforeInsert != nil:
+		d.beforeInsert(ctx)
+	case sql == pgstore.SelectSQL && d.beforeSelect != nil:
+		d.beforeSelect(ctx)
+	}
+	return d.DB.QueryRow(ctx, sql, args...)
+}
+
+// TestAcquireRetriesWhenTheRowVanishes covers Acquire's insert-then-select
+// race: the INSERT finds a live row, which is released or expires before
+// the SELECT can read it. Acquire must try again, and give up with an error
+// if that keeps happening.
+func TestAcquireRetriesWhenTheRowVanishes(t *testing.T) {
+	p := testPool(t)
+	t.Parallel()
+	direct := pgstore.New(p)
+	fp := idempotency.Fingerprint{1}
+	// hold makes another request claim key; vanish releases that claim.
+	hold := func(t *testing.T, ctx context.Context, key string) {
+		t.Helper()
+		if _, err := direct.Acquire(ctx, key, "other", fp, time.Minute); err != nil {
+			t.Error(err)
+		}
+	}
+	vanish := func(t *testing.T, ctx context.Context, key string) {
+		t.Helper()
+		if err := direct.Release(ctx, key, "other"); err != nil {
+			t.Error(err)
+		}
+	}
+
+	t.Run("once", func(t *testing.T) {
+		t.Parallel()
+		key := "vanish-once/" + rand.Text()
+		hold(t, t.Context(), key)
+		selects := 0
+		s := pgstore.New(&racingDB{DB: p, beforeSelect: func(ctx context.Context) {
+			selects++
+			if selects == 1 {
+				vanish(t, ctx, key)
+			}
+		}})
+		acq, err := s.Acquire(t.Context(), key, "mine", fp, time.Minute)
+		if err != nil || !acq.Acquired {
+			t.Fatalf("Acquire = %+v, %v; want acquired after one retry", acq, err)
+		}
+	})
+	t.Run("every time", func(t *testing.T) {
+		t.Parallel()
+		key := "vanish-always/" + rand.Text()
+		inserts := 0
+		s := pgstore.New(&racingDB{
+			DB:           p,
+			beforeInsert: func(ctx context.Context) { inserts++; hold(t, ctx, key) },
+			beforeSelect: func(ctx context.Context) { vanish(t, ctx, key) },
+		})
+		_, err := s.Acquire(t.Context(), key, "mine", fp, time.Minute)
+		if err == nil || !strings.Contains(err.Error(), "changed state") {
+			t.Fatalf("Acquire err = %v, want the retries to give up", err)
+		}
+		if inserts != pgstore.MaxAcquireAttempts {
+			t.Errorf("%d attempts, want %d", inserts, pgstore.MaxAcquireAttempts)
+		}
+	})
+	t.Run("select fails", func(t *testing.T) {
+		t.Parallel()
+		key := "select-fails/" + rand.Text()
+		hold(t, t.Context(), key)
+		ctx, cancel := context.WithCancel(t.Context())
+		s := pgstore.New(&racingDB{DB: p, beforeSelect: func(context.Context) { cancel() }})
+		_, err := s.Acquire(ctx, key, "mine", fp, time.Minute)
+		if err == nil || !strings.Contains(err.Error(), "reading existing record") {
+			t.Fatalf("Acquire err = %v, want the failed read to be reported", err)
+		}
+	})
 }
 
 func TestMiddlewareWithPostgresStore(t *testing.T) {
