@@ -721,12 +721,45 @@ func TestOversizedResponseIsNotReplayedButNotRerun(t *testing.T) {
 	if second.Header().Get(idempotency.ReplayedHeader) != "true" {
 		t.Error("stored problem is not marked as replayed")
 	}
-	if !strings.Contains(p.Detail, "12-byte") {
-		t.Errorf("detail %q does not mention the limit", p.Detail)
+	if !strings.Contains(p.Detail, "12-byte") || !strings.Contains(p.Detail, "status 200") {
+		t.Errorf("detail %q does not mention the limit and the original status", p.Detail)
 	}
 	if h.Calls() != 1 {
 		t.Errorf("handler ran %d times, want 1", h.Calls())
 	}
+}
+
+// TestOversizedErrorResponseIsNotStored: an error response says the request
+// was not carried out, so an oversized one is released rather than replaced
+// by a 500 claiming the request was processed.
+func TestOversizedErrorResponseIsNotStored(t *testing.T) {
+	t.Parallel()
+	h := &counter{h: func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "amount must be positive", http.StatusBadRequest)
+	}}
+	mw := newMiddleware(t, idempotency.Config{MaxResponseBytes: 4}).Handler(h)
+	for range 2 {
+		w := serve(mw, request{key: testKey})
+		if w.Code != http.StatusBadRequest || w.Header().Get(idempotency.ReplayedHeader) != "" {
+			t.Fatalf("status %d replayed %q, want a fresh 400", w.Code, w.Header().Get(idempotency.ReplayedHeader))
+		}
+	}
+	if h.Calls() != 2 {
+		t.Errorf("handler ran %d times, want 2", h.Calls())
+	}
+}
+
+// TestBodyOnBodylessStatusIsNotCaptured: net/http drops body bytes written
+// after a 204 (ErrBodyNotAllowed), so they must not count towards
+// MaxResponseBytes either.
+func TestBodyOnBodylessStatusIsNotCaptured(t *testing.T) {
+	t.Parallel()
+	mw := newMiddleware(t, idempotency.Config{MaxResponseBytes: 4}).Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+		_, _ = w.Write([]byte("ignored body"))
+	}))
+	serve(mw, request{key: testKey})
+	wantReplay(t, serve(mw, request{key: testKey}), http.StatusNoContent, "")
 }
 
 func TestPanickingHandlerReleasesKey(t *testing.T) {

@@ -115,9 +115,10 @@ type Config struct {
 
 	// MaxResponseBytes bounds the response body that is captured for replay.
 	// A larger response is still sent to the original client, but cannot be
-	// replayed: later requests with the key get a 500 problem
-	// (response-not-replayable) rather than running the handler a second
-	// time. Default: [DefaultMaxResponseBytes].
+	// replayed. If its status is below 400, later requests with the key get a
+	// 500 problem (response-not-replayable) rather than running the handler a
+	// second time; a larger error response is not stored, so a retry runs the
+	// handler again. Default: [DefaultMaxResponseBytes].
 	MaxResponseBytes int64
 
 	// Lease is how long an in-flight lock lives without renewal. While the
@@ -485,9 +486,15 @@ func (m *Middleware) run(w http.ResponseWriter, r *http.Request, next http.Handl
 	switch {
 	case !replayable || !m.cfg.ShouldStore(resp.StatusCode):
 		m.release(ctx, deadline, key, token)
+	case rec.overflow && resp.StatusCode >= http.StatusBadRequest:
+		// An error response says the request was not carried out, so running
+		// the handler again is harmless, and replaying a 500 that claims the
+		// request was processed would be wrong.
+		m.release(ctx, deadline, key, token)
 	case rec.overflow:
 		m.complete(ctx, deadline, key, token, m.renderProblem(r, ProblemResponseNotReplayable,
-			fmt.Sprintf("The original request was processed, but its response exceeded the %d-byte replay limit and was not stored. Do not retry it with a new key unless you intend to repeat it.", m.cfg.MaxResponseBytes)))
+			fmt.Sprintf("The original request completed with status %d, but its response exceeded the %d-byte replay limit and was not stored. Do not retry it with a new key unless you intend to repeat it.",
+				resp.StatusCode, m.cfg.MaxResponseBytes)))
 	default:
 		m.complete(ctx, deadline, key, token, resp)
 	}

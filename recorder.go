@@ -57,7 +57,10 @@ func (r *recorder) Write(p []byte) (int, error) {
 	if !r.wroteHeader {
 		r.WriteHeader(http.StatusOK)
 	}
-	if !r.overflow {
+	// net/http refuses body bytes for statuses that have no content
+	// (ErrBodyNotAllowed); they are not part of the response, so they are
+	// neither captured nor counted against the limit.
+	if !r.overflow && bodyAllowed(r.status) {
 		if int64(r.body.Len())+int64(len(p)) > r.limit {
 			r.overflow = true
 			r.body = bytes.Buffer{}
