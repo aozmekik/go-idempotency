@@ -7,6 +7,28 @@
 // Complete and Release check the caller's token before changing anything.
 // Expiry uses Redis key TTLs, so every application instance agrees on when a
 // lease or a stored response expires: there is one clock, the Redis server's.
+//
+// # Deployment requirements
+//
+// The store's guarantees are only as strong as the Redis deployment's.
+//
+// Eviction: every record has a TTL, so it is a candidate for eviction under
+// the volatile-* policies (volatile-lru is the default of several managed
+// Redis services) as well as the allkeys-* ones. An evicted in-flight lock
+// lets a duplicate run the handler while the original is still running; an
+// evicted response lets a retry run it again. Configure the instance with
+// maxmemory-policy noeviction, preferably dedicated to this store. A full
+// instance then rejects writes instead: Acquire fails and the middleware
+// answers 503, and a Complete that fails is logged and leaves that key in
+// flight until its lease expires.
+//
+// Replication: Redis replicates asynchronously, so a lock or response
+// acknowledged by the primary can be missing on a replica promoted by a
+// failover, and a retry then runs the handler again. Token fencing does not
+// help here, and WAIT narrows the window without closing it. Where a second
+// execution after a failover is unacceptable, make the downstream effect
+// idempotent as well (pass the key on, see idempotency.KeyFromContext) or
+// keep the records in the same database as the effect.
 package redisstore
 
 import (
