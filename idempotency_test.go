@@ -504,7 +504,11 @@ func TestStoragePolicy(t *testing.T) {
 		wantStored  bool
 	}{
 		{"2xx stored by default", http.StatusCreated, nil, true},
-		{"4xx stored by default", http.StatusBadRequest, nil, true},
+		{"400 stored by default", http.StatusBadRequest, nil, true},
+		{"404 stored by default", http.StatusNotFound, nil, true},
+		{"422 stored by default", http.StatusUnprocessableEntity, nil, true},
+		{"401 not stored by default", http.StatusUnauthorized, nil, false},
+		{"429 not stored by default", http.StatusTooManyRequests, nil, false},
 		{"500 not stored by default", http.StatusInternalServerError, nil, false},
 		{"503 not stored by default", http.StatusServiceUnavailable, nil, false},
 		{"custom policy rejects 4xx", http.StatusConflict, func(c int) bool { return c < 400 }, false},
@@ -535,6 +539,88 @@ func TestStoragePolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDefaultShouldStore(t *testing.T) {
+	t.Parallel()
+	transient := map[int]bool{
+		http.StatusUnauthorized: true, http.StatusForbidden: true, http.StatusRequestTimeout: true,
+		http.StatusConflict: true, http.StatusLocked: true, http.StatusTooEarly: true, http.StatusTooManyRequests: true,
+	}
+	for code := 200; code < 600; code++ {
+		want := code < 500 && !transient[code]
+		if got := idempotency.DefaultShouldStore(code); got != want {
+			t.Errorf("DefaultShouldStore(%d) = %v, want %v", code, got, want)
+		}
+	}
+}
+
+// TestRetryAfterRateLimitCanSucceed is the case the default policy exists
+// for: a throttled request must not be answered with a stored 429 for the
+// whole TTL once the client waits and retries with the same key.
+func TestRetryAfterRateLimitCanSucceed(t *testing.T) {
+	t.Parallel()
+	var throttled atomic.Bool
+	throttled.Store(true)
+	h := &counter{h: func(w http.ResponseWriter, r *http.Request) {
+		if throttled.Swap(false) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+			return
+		}
+		created(w, r)
+	}}
+	mw := newMiddleware(t, idempotency.Config{}).Handler(h)
+	if w := serve(mw, request{key: testKey}); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("first status = %d, want 429", w.Code)
+	}
+	if w := serve(mw, request{key: testKey}); w.Code != http.StatusCreated || w.Header().Get(idempotency.ReplayedHeader) != "" {
+		t.Fatalf("retry: status %d, want a fresh 201", w.Code)
+	}
+	if h.Calls() != 2 {
+		t.Errorf("handler ran %d times, want 2", h.Calls())
+	}
+}
+
+// TestRequiredHeadersAreReplayed checks the default allowlist against
+// headers that RFC 9110 requires for particular statuses, and the security
+// header http.Error sets.
+func TestRequiredHeadersAreReplayed(t *testing.T) {
+	t.Parallel()
+	t.Run("Allow on 405 from a mux", func(t *testing.T) {
+		t.Parallel()
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /payments", func(http.ResponseWriter, *http.Request) {})
+		mw := newMiddleware(t, idempotency.Config{}).Handler(mux)
+		first := serve(mw, request{key: testKey})
+		if first.Code != http.StatusMethodNotAllowed || first.Header().Get("Allow") == "" {
+			t.Fatalf("first: %d Allow=%q", first.Code, first.Header().Get("Allow"))
+		}
+		replayed := serve(mw, request{key: testKey})
+		wantReplay(t, replayed, http.StatusMethodNotAllowed, first.Body.String())
+		for _, name := range []string{"Allow", "X-Content-Type-Options"} {
+			if got, want := replayed.Header().Get(name), first.Header().Get(name); got != want {
+				t.Errorf("replayed %s = %q, want %q", name, got, want)
+			}
+		}
+	})
+	t.Run("WWW-Authenticate and Retry-After when the policy stores them", func(t *testing.T) {
+		t.Parallel()
+		for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+			mw := newMiddleware(t, idempotency.Config{ShouldStore: func(int) bool { return true }}).Handler(
+				http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("WWW-Authenticate", `Bearer realm="api"`)
+					w.Header().Set("Retry-After", "30")
+					w.WriteHeader(status)
+				}))
+			serve(mw, request{key: testKey})
+			replayed := serve(mw, request{key: testKey})
+			wantReplay(t, replayed, status, "")
+			if replayed.Header().Get("WWW-Authenticate") == "" || replayed.Header().Get("Retry-After") != "30" {
+				t.Errorf("%d replay lost WWW-Authenticate or Retry-After: %v", status, replayed.Header())
+			}
+		}
+	})
 }
 
 func TestRetryAfterServerErrorCanSucceed(t *testing.T) {

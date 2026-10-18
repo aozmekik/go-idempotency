@@ -37,19 +37,39 @@ const ReplayedHeader = "Idempotent-Replayed"
 func DefaultMethods() []string { return []string{http.MethodPost, http.MethodPatch} }
 
 // DefaultReplayHeaders returns the response headers that are stored and
-// replayed by default. Set-Cookie is deliberately absent: replaying a session
-// cookie to whoever presents the key is rarely intended. Add it to
-// Config.ReplayHeaders explicitly if you need it.
+// replayed by default: those that describe the content or the outcome,
+// including the ones RFC 9110 requires for particular statuses (Allow on 405,
+// WWW-Authenticate on 401) and Retry-After. Set-Cookie is deliberately
+// absent: replaying a session cookie to whoever presents the key is rarely
+// intended. Add it to Config.ReplayHeaders explicitly if you need it.
 func DefaultReplayHeaders() []string {
 	return []string{
-		"Content-Type", "Content-Encoding", "Content-Language", "Content-Location",
-		"Location", "ETag", "Last-Modified", "Link", "Vary",
+		"Allow", "Cache-Control", "Content-Disposition", "Content-Encoding",
+		"Content-Language", "Content-Location", "Content-Type", "ETag",
+		"Last-Modified", "Link", "Location", "Retry-After", "Vary",
+		"WWW-Authenticate", "X-Content-Type-Options",
 	}
 }
 
-// DefaultShouldStore stores every response except server errors (5xx), so a
-// client can retry a request that failed because of a transient fault.
-func DefaultShouldStore(statusCode int) bool { return statusCode < http.StatusInternalServerError }
+// DefaultShouldStore stores every final response except those that describe
+// a passing condition rather than an answer to the request, so that a client
+// retrying with the same key can still succeed:
+//
+//   - server errors (5xx), which are often transient;
+//   - 408 Request Timeout, 409 Conflict, 423 Locked, 425 Too Early and
+//     429 Too Many Requests, which say "not now";
+//   - 401 Unauthorized and 403 Forbidden, which depend on credentials and
+//     permissions that are not part of the fingerprint.
+//
+// Other 4xx responses are stored and replayed, as the draft asks.
+func DefaultShouldStore(statusCode int) bool {
+	switch statusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout,
+		http.StatusConflict, http.StatusLocked, http.StatusTooEarly, http.StatusTooManyRequests:
+		return false
+	}
+	return statusCode < http.StatusInternalServerError
+}
 
 // Config configures a [Middleware]. Only Store is required.
 type Config struct {
