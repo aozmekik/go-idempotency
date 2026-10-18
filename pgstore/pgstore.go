@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -73,9 +74,22 @@ func New(db DB, opts ...Option) *Store {
 	return s
 }
 
-// Migrate creates the table and index if they do not exist.
+// migrateLockID is the advisory lock key Migrate holds while it applies
+// [Schema]: the first eight bytes of the SHA-256 of this package's import
+// path, read as a signed integer. Any value works as long as the
+// application's own advisory locks do not use it.
+const migrateLockID int64 = 4236433563854485465
+
+// Migrate creates the table and index if they do not exist. It is safe to
+// call from many instances at once, as replicas of one service starting
+// together do: CREATE TABLE IF NOT EXISTS on its own is not (concurrent
+// calls can fail with a unique violation), so Migrate first takes a
+// transaction-scoped advisory lock. A pgx Exec without arguments uses the
+// simple query protocol, which runs the statements as one transaction, so
+// the lock covers the whole schema.
 func (s *Store) Migrate(ctx context.Context) error {
-	if _, err := s.db.Exec(ctx, Schema); err != nil {
+	sql := "SELECT pg_advisory_xact_lock(" + strconv.FormatInt(migrateLockID, 10) + ");\n" + Schema
+	if _, err := s.db.Exec(ctx, sql); err != nil {
 		return fmt.Errorf("pgstore: migrate: %w", err)
 	}
 	return nil

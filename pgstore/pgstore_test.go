@@ -110,6 +110,59 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestMigrateConcurrently starts several instances at once on a fresh
+// schema, as a deployment of several replicas does. CREATE TABLE IF NOT
+// EXISTS alone is not safe to run concurrently: without Migrate's advisory
+// lock, some calls fail with a unique violation on pg_type.
+func TestMigrateConcurrently(t *testing.T) {
+	p := testPool(t)
+	t.Parallel()
+	ctx := t.Context()
+	const rounds, instances = 10, 8
+	for round := range rounds {
+		schema := "migrate_test_" + strings.ToLower(rand.Text())
+		if _, err := p.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = p.Exec(context.WithoutCancel(ctx), "DROP SCHEMA "+schema+" CASCADE") })
+		cfg := p.Config()
+		cfg.ConnConfig.RuntimeParams["search_path"] = schema
+		cfg.MaxConns = instances
+		pool, err := pgxpool.NewWithConfig(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Open every connection first, so that the Migrate calls overlap.
+		conns := make([]*pgxpool.Conn, instances)
+		for i := range conns {
+			if conns[i], err = pool.Acquire(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, c := range conns {
+			c.Release()
+		}
+		errs := make(chan error, instances)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range instances {
+			wg.Go(func() {
+				<-start
+				errs <- pgstore.New(pool).Migrate(ctx)
+			})
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		pool.Close()
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("round %d: %v", round, err)
+			}
+		}
+	}
+}
+
 // TestDeleteExpired is deliberately not parallel: DeleteExpired affects the
 // whole table, and Go starts parallel tests only after sequential ones end.
 func TestDeleteExpired(t *testing.T) {
@@ -152,6 +205,9 @@ func TestErrorsAreWrapped(t *testing.T) {
 	}
 	if _, err := s.DeleteExpired(ctx); err == nil || !strings.HasPrefix(err.Error(), "pgstore: delete expired:") {
 		t.Errorf("DeleteExpired err = %v", err)
+	}
+	if err := s.Migrate(ctx); err == nil || !strings.HasPrefix(err.Error(), "pgstore: migrate:") {
+		t.Errorf("Migrate err = %v", err)
 	}
 }
 
