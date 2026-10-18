@@ -330,7 +330,13 @@ func TestCustomHeaderName(t *testing.T) {
 	req := request{header: http.Header{"X-Idempotency-Key": {testKey}}}
 	serve(mw, req)
 	wantReplay(t, serve(mw, req), http.StatusCreated, `{"id":"pay_1","echo":}`)
-	wantProblem(t, serve(mw, request{key: testKey}), http.StatusBadRequest, idempotency.ProblemKeyMissing)
+	missing := wantProblem(t, serve(mw, request{key: testKey}), http.StatusBadRequest, idempotency.ProblemKeyMissing)
+	invalid := wantProblem(t, serve(mw, request{header: http.Header{"X-Idempotency-Key": {"bare"}}}), http.StatusBadRequest, idempotency.ProblemKeyInvalid)
+	for _, p := range []problemBody{missing, invalid} {
+		if strings.Contains(p.Title, "Idempotency-Key") || !strings.Contains(p.Detail, "X-Idempotency-Key") {
+			t.Errorf("problem %+v: the title must not name another header, and the detail must name the configured one", p)
+		}
+	}
 }
 
 func TestInvalidKeys(t *testing.T) {
@@ -483,9 +489,13 @@ func TestConcurrentDuplicateGetsConflict(t *testing.T) {
 	go func() { firstDone <- serve(mw, request{key: testKey}) }()
 	<-entered
 
-	p := wantProblem(t, serve(mw, request{key: testKey}), http.StatusConflict, idempotency.ProblemRequestInFlight)
+	w := serve(mw, request{key: testKey})
+	p := wantProblem(t, w, http.StatusConflict, idempotency.ProblemRequestInFlight)
 	if !strings.Contains(p.Detail, "Retry") {
 		t.Errorf("detail %q should tell the client to retry", p.Detail)
+	}
+	if got := w.Header().Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want 1", got)
 	}
 	close(release)
 	first := <-firstDone
@@ -1133,9 +1143,13 @@ func TestStoreFailures(t *testing.T) {
 		store, logger, logs := newFaulty(t, &faultyStore{acquireErr: errors.New("connection refused")})
 		h := &counter{h: created}
 		mw := newMiddleware(t, idempotency.Config{Store: store, Logger: logger}).Handler(h)
-		wantProblem(t, serve(mw, request{key: testKey}), http.StatusServiceUnavailable, idempotency.ProblemStoreUnavailable)
+		w := serve(mw, request{key: testKey})
+		wantProblem(t, w, http.StatusServiceUnavailable, idempotency.ProblemStoreUnavailable)
 		if h.Calls() != 0 {
 			t.Error("handler ran although the store was unavailable")
+		}
+		if got := w.Header().Get("Retry-After"); got != "1" {
+			t.Errorf("Retry-After = %q, want 1", got)
 		}
 		if !strings.Contains(logs.String(), "connection refused") {
 			t.Errorf("store error not logged: %s", logs)
