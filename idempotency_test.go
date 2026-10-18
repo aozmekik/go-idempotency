@@ -152,6 +152,7 @@ func TestNewValidatesConfig(t *testing.T) {
 		{"missing store", idempotency.Config{}, "Store is required"},
 		{"bad header name", idempotency.Config{Store: store, HeaderName: "Idem Key"}, "invalid header name"},
 		{"bad method", idempotency.Config{Store: store, Methods: []string{"PO ST"}}, "invalid method"},
+		{"empty method", idempotency.Config{Store: store, Methods: []string{""}}, "invalid method"},
 		{"negative key length", idempotency.Config{Store: store, MaxKeyLength: -1}, "MaxKeyLength"},
 		{"negative body limit", idempotency.Config{Store: store, MaxBodyBytes: -1}, "MaxBodyBytes"},
 		{"negative response limit", idempotency.Config{Store: store, MaxResponseBytes: -1}, "MaxResponseBytes"},
@@ -816,6 +817,22 @@ func TestPanicIsStoredWhenPolicyStoresServerErrors(t *testing.T) {
 	}
 }
 
+// TestStoredProblemFromMinimalWriter stores a problem rendered by a custom
+// ProblemWriter that writes a body without calling WriteHeader, which means
+// 200 in net/http; the stored response must say the same.
+func TestStoredProblemFromMinimalWriter(t *testing.T) {
+	t.Parallel()
+	mw := newMiddleware(t, idempotency.Config{
+		ShouldStore:   func(int) bool { return true },
+		ProblemWriter: func(w http.ResponseWriter, _ *http.Request, p *idempotency.Problem) { _, _ = w.Write([]byte(p.Slug)) },
+	}).Handler(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) }))
+	func() {
+		defer func() { _ = recover() }()
+		serve(mw, request{key: testKey})
+	}()
+	wantReplay(t, serve(mw, request{key: testKey}), http.StatusOK, idempotency.ProblemRequestFailed)
+}
+
 func TestScopesAreIsolated(t *testing.T) {
 	t.Parallel()
 	h := &counter{h: func(w http.ResponseWriter, r *http.Request) {
@@ -1153,6 +1170,17 @@ func TestStoreFailures(t *testing.T) {
 		}
 		if !strings.Contains(logs.String(), "connection refused") {
 			t.Errorf("store error not logged: %s", logs)
+		}
+	})
+	t.Run("failed release after a failed acquire is only a debug message", func(t *testing.T) {
+		t.Parallel()
+		logs := &syncBuffer{}
+		logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		store, _, _ := newFaulty(t, &faultyStore{acquireErr: errors.New("connection refused"), releaseErr: errors.New("connection refused")})
+		mw := newMiddleware(t, idempotency.Config{Store: store, Logger: logger}).Handler(http.HandlerFunc(created))
+		wantProblem(t, serve(mw, request{key: testKey}), http.StatusServiceUnavailable, idempotency.ProblemStoreUnavailable)
+		if !strings.Contains(logs.String(), "level=DEBUG msg=\"idempotency: releasing the claim of a failed acquire failed\"") {
+			t.Errorf("want a debug message for the failed release, got: %s", logs)
 		}
 	})
 	t.Run("acquire canceled by client is not logged as an error", func(t *testing.T) {

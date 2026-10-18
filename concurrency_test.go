@@ -274,6 +274,34 @@ func TestLeaseLostWhileHandlerRuns(t *testing.T) {
 	})
 }
 
+// TestPanicAfterLeaseLostLeavesRecordAlone: a handler that panics after its
+// lease was lost must not store or release anything, because the key may
+// already belong to another request.
+func TestPanicAfterLeaseLostLeavesRecordAlone(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		const lease = 3 * time.Second
+		store, logger, _ := newFaulty(t, &faultyStore{
+			onExtend: func(context.Context, int, func() error) error { return idempotency.ErrLockLost },
+		})
+		mw := newMiddleware(t, idempotency.Config{
+			Store: store, Logger: logger, Lease: lease,
+			ShouldStore: func(int) bool { return true }, // would store a request-failed problem
+		}).Handler(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			time.Sleep(2 * time.Second) // the renewal at 1s reports the loss
+			panic(http.ErrAbortHandler)
+		}))
+		func() {
+			defer func() { _ = recover() }()
+			serve(mw, request{key: testKey})
+		}()
+		if store.releaseCalls.Load() != 0 {
+			t.Error("a request that lost its lease released the key")
+		}
+		wantProblem(t, serve(mw, request{key: testKey}), http.StatusConflict, idempotency.ProblemRequestInFlight)
+	})
+}
+
 // TestTransientRenewalErrorsAreRetried checks that a failed renewal is
 // logged and retried rather than treated as a lost lock.
 func TestTransientRenewalErrorsAreRetried(t *testing.T) {
