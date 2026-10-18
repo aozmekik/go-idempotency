@@ -65,7 +65,12 @@ go test -run '^$' -fuzz '^FuzzFormatKey$' -fuzztime 60s .
 
 git clone https://github.com/httpwg/structured-field-tests /tmp/sf-tests
 SFV_TEST_VECTORS=/tmp/sf-tests go test -run TestVectors -v ./internal/sfv
+
+python3 testdata/fingerprint.py   # must print the digest pinned in fingerprint_test.go
 ```
+
+The fingerprint encoding is part of the stored data: changing it requires a new
+`fingerprintVersion` and an update of both `testdata/fingerprint.py` and the pinned digest.
 
 ## Benchmarks
 

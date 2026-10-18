@@ -85,7 +85,7 @@ jobs:
         run: go test -race -shuffle=on -count=1 ./...
 
   conformance:
-    name: Structured Field test vectors
+    name: Conformance (Structured Field vectors, fingerprint)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -102,6 +102,11 @@ jobs:
         env:
           SFV_TEST_VECTORS: ${{ github.workspace }}/structured-field-tests
         run: go test -count=1 -run TestVectors -v ./internal/sfv
+      - name: Check the pinned fingerprint against the Python implementation
+        run: |
+          want="$(python3 testdata/fingerprint.py)"
+          echo "testdata/fingerprint.py: $want"
+          grep -q "\"$want\"" fingerprint_test.go
 
   fuzz:
     name: Fuzz (${{ matrix.target }})
