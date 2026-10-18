@@ -122,7 +122,9 @@ func (r *recorder) snapshot() http.Header {
 			hopByHop = append(hopByHop, http.CanonicalHeaderKey(strings.TrimSpace(opt)))
 		}
 	}
-	out := make(http.Header, len(r.allow))
+	// No size hint: a response usually carries a few of the allowlisted
+	// headers, and a map sized for the whole list costs ~700 bytes per request.
+	out := make(http.Header)
 	for _, name := range r.allow {
 		if slices.Contains(hopByHop, name) {
 			continue
