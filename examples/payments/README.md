@@ -15,14 +15,18 @@ Routes:
 
 ## Run it
 
+From the repository root:
+
 ```sh
-go run ./examples/payments -charge-delay 2s
+go run ./examples/payments -addr localhost:18080 -charge-delay 2s
 ```
 
 `-charge-delay` makes every charge take that long, which makes the in-flight
 `409 Conflict` easy to see. The walkthrough below was captured from a real run
-of this command (`-addr 127.0.0.1:18080`); `Date` headers are left out.
-`TestWalkthrough` in `main_test.go` checks the same sequence on every test run.
+of the server with these flags; `Date` headers are left out.
+`TestWalkthrough` in `main_test.go` repeats steps 1 to 3 and 5 to 8 and checks
+the status codes, the replay marker and the bodies shown here;
+`TestInFlightConflict` covers step 4 on a virtual clock.
 
 ## Walkthrough
 
@@ -77,13 +81,14 @@ Cache-Control: no-store
 Content-Length: 302
 Content-Type: application/problem+json
 
-{"type":"https://github.com/aozmekik/go-idempotency/blob/main/docs/problems.md#key-reused","title":"Idempotency-Key reused with a different request","status":422,"detail":"This key was already used for a request with a different method, path, query, headers or body. Use a new key for a new request."}
+{"type":"https://github.com/aozmekik/go-idempotency/blob/main/docs/problems.md#key-reused","title":"Idempotency key reused with a different request","status":422,"detail":"This key was already used for a request with a different method, path, query, headers or body. Use a new key for a new request."}
 ```
 
 ### 4. Send a duplicate while the original is still running
 
 The first request is started in the background; the duplicate arrives half a
-second later, while the 2-second charge is still in progress.
+second later, while the 2-second charge is still in progress. `Retry-After`
+is a hint; the original usually finishes well within it.
 
 ```console
 $ curl -s -o /dev/null -w 'first:  %{http_code}\n' -X POST localhost:18080/payments \
@@ -99,8 +104,9 @@ HTTP/1.1 409 Conflict
 Cache-Control: no-store
 Content-Length: 266
 Content-Type: application/problem+json
+Retry-After: 1
 
-{"type":"https://github.com/aozmekik/go-idempotency/blob/main/docs/problems.md#request-in-flight","title":"A request with this Idempotency-Key is being processed","status":409,"detail":"The original request is still being processed. Retry later with the same key."}
+{"type":"https://github.com/aozmekik/go-idempotency/blob/main/docs/problems.md#request-in-flight","title":"A request with this idempotency key is being processed","status":409,"detail":"The original request is still being processed. Retry later with the same key."}
 first:  201
 ```
 
@@ -112,10 +118,10 @@ $ curl -si -X POST localhost:18080/payments \
     -d '{"amount":1999,"currency":"EUR"}'
 HTTP/1.1 400 Bad Request
 Cache-Control: no-store
-Content-Length: 237
+Content-Length: 230
 Content-Type: application/problem+json
 
-{"type":"https://github.com/aozmekik/go-idempotency/blob/main/docs/problems.md#key-missing","title":"Idempotency-Key header is required","status":400,"detail":"Send an Idempotency-Key header with a unique, quoted key for this request."}
+{"type":"https://github.com/aozmekik/go-idempotency/blob/main/docs/problems.md#key-missing","title":"Idempotency key is required","status":400,"detail":"Send an Idempotency-Key header with a unique, quoted key for this request."}
 ```
 
 ### 6. Send the key without quotes
@@ -131,10 +137,10 @@ $ curl -si -X POST localhost:18080/payments \
     -d '{"amount":1999,"currency":"EUR"}'
 HTTP/1.1 400 Bad Request
 Cache-Control: no-store
-Content-Length: 303
+Content-Length: 296
 Content-Type: application/problem+json
 
-{"type":"https://github.com/aozmekik/go-idempotency/blob/main/docs/problems.md#key-invalid","title":"Idempotency-Key header is malformed","status":400,"detail":"The Idempotency-Key header must be a single Structured Field String, for example Idempotency-Key: \"8e03978e-40d5-43e8-bc93-6894a57f9324\"."}
+{"type":"https://github.com/aozmekik/go-idempotency/blob/main/docs/problems.md#key-invalid","title":"Idempotency key is malformed","status":400,"detail":"The Idempotency-Key header must be a single Structured Field String, for example Idempotency-Key: \"8e03978e-40d5-43e8-bc93-6894a57f9324\"."}
 ```
 
 ### 7. Count the payments
@@ -147,5 +153,22 @@ $ curl -s localhost:18080/payments -H 'Authorization: Bearer alice'
 [{"id":"pay_1","account":"alice","amount":1999,"currency":"EUR","status":"succeeded","idempotency_key":"3f1c2a9e-0b7d-4c55-9e0e-5d6b8a7c4f21"},{"id":"pay_2","account":"alice","amount":500,"currency":"EUR","status":"succeeded","idempotency_key":"7a0d3c1e-2b4f-4e6a-8c9d-0f1e2d3c4b5a"}]
 ```
 
-The same key sent by another account (`Bearer bob`) is a different key, because
-`Config.Scope` returns the account name.
+### 8. Send alice's first key from another account
+
+`Config.Scope` returns the authenticated account, so bob's request with the
+key from step 1 is a new request in bob's own key space: a fresh `201`, not a
+replay of alice's payment and not a `422`.
+
+```console
+$ curl -si -X POST localhost:18080/payments \
+    -H 'Authorization: Bearer bob' \
+    -H 'Content-Type: application/json' \
+    -H 'Idempotency-Key: "3f1c2a9e-0b7d-4c55-9e0e-5d6b8a7c4f21"' \
+    -d '{"amount":1999,"currency":"EUR"}'
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /payments/pay_3
+Content-Length: 140
+
+{"id":"pay_3","account":"bob","amount":1999,"currency":"EUR","status":"succeeded","idempotency_key":"3f1c2a9e-0b7d-4c55-9e0e-5d6b8a7c4f21"}
+```

@@ -14,7 +14,11 @@ import (
 	"github.com/aozmekik/go-idempotency/memstore"
 )
 
-// TestWalkthrough follows the curl walkthrough in README.md.
+// TestWalkthrough repeats the curl walkthrough in README.md, except step 4
+// (the in-flight 409, see TestInFlightConflict), whose payment it creates
+// directly so that payment IDs match the README. It checks the status codes,
+// the replay marker and the bodies shown there, then a few cases the README
+// does not show.
 func TestWalkthrough(t *testing.T) {
 	t.Parallel()
 	store := memstore.New(memstore.WithCleanupInterval(0))
@@ -27,10 +31,12 @@ func TestWalkthrough(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	type response struct {
-		StatusCode int
-		Header     http.Header
+		status   int
+		replayed string
+		problem  string // the problem type's slug, if any
+		body     string
 	}
-	do := func(method, path, account, key, body string) (response, string) {
+	do := func(method, path, account, key, body string) response {
 		t.Helper()
 		req, err := http.NewRequestWithContext(t.Context(), method, srv.URL+path, strings.NewReader(body))
 		if err != nil {
@@ -52,73 +58,52 @@ func TestWalkthrough(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return response{resp.StatusCode, resp.Header}, string(b)
+		r := response{status: resp.StatusCode, replayed: resp.Header.Get("Idempotent-Replayed"), body: string(b)}
+		if resp.Header.Get("Content-Type") == "application/problem+json" {
+			var p struct{ Type string }
+			if err := json.Unmarshal(b, &p); err != nil {
+				t.Fatal(err)
+			}
+			_, r.problem, _ = strings.Cut(p.Type, "#")
+		}
+		return r
+	}
+	want := func(step string, got, want response) {
+		t.Helper()
+		if want.body == "" {
+			got.body = "" // not compared
+		}
+		if got != want {
+			t.Errorf("%s: got %+v, want %+v", step, got, want)
+		}
 	}
 
-	const key = `"3f1c2a9e-0b7d-4c55-9e0e-5d6b8a7c4f21"`
-	body := `{"amount":1999,"currency":"EUR"}`
+	const (
+		keyA  = `"3f1c2a9e-0b7d-4c55-9e0e-5d6b8a7c4f21"`
+		keyB  = `"7a0d3c1e-2b4f-4e6a-8c9d-0f1e2d3c4b5a"`
+		body  = `{"amount":1999,"currency":"EUR"}`
+		pay1  = `{"id":"pay_1","account":"alice","amount":1999,"currency":"EUR","status":"succeeded","idempotency_key":"3f1c2a9e-0b7d-4c55-9e0e-5d6b8a7c4f21"}`
+		pay2  = `{"id":"pay_2","account":"alice","amount":500,"currency":"EUR","status":"succeeded","idempotency_key":"7a0d3c1e-2b4f-4e6a-8c9d-0f1e2d3c4b5a"}`
+		pay3  = `{"id":"pay_3","account":"bob","amount":1999,"currency":"EUR","status":"succeeded","idempotency_key":"3f1c2a9e-0b7d-4c55-9e0e-5d6b8a7c4f21"}`
+		posts = "/payments"
+	)
+	want("1. create", do(http.MethodPost, posts, "alice", keyA, body), response{status: 201, body: pay1 + "\n"})
+	want("2. retry", do(http.MethodPost, posts, "alice", keyA, body), response{status: 201, replayed: "true", body: pay1 + "\n"})
+	want("3. reuse", do(http.MethodPost, posts, "alice", keyA, `{"amount":2999,"currency":"EUR"}`), response{status: 422, problem: "key-reused"})
+	want("4. second payment", do(http.MethodPost, posts, "alice", keyB, `{"amount":500,"currency":"EUR"}`), response{status: 201, body: pay2 + "\n"})
+	want("5. no key", do(http.MethodPost, posts, "alice", "", body), response{status: 400, problem: "key-missing"})
+	want("6. unquoted key", do(http.MethodPost, posts, "alice", "3f1c2a9e-0b7d-4c55-9e0e-5d6b8a7c4f21", body), response{status: 400, problem: "key-invalid"})
+	want("7. list", do(http.MethodGet, posts, "alice", "", ""), response{status: 200, body: "[" + pay1 + "," + pay2 + "]\n"})
+	want("8. same key, other account", do(http.MethodPost, posts, "bob", keyA, body), response{status: 201, body: pay3 + "\n"})
 
-	first, firstBody := do(http.MethodPost, "/payments", "alice", key, body)
-	if first.StatusCode != http.StatusCreated || first.Header.Get("Idempotent-Replayed") != "" {
-		t.Fatalf("create: %d %s", first.StatusCode, firstBody)
-	}
-	if first.Header.Get("Location") != "/payments/pay_1" {
-		t.Errorf("Location = %q", first.Header.Get("Location"))
-	}
-
-	retry, retryBody := do(http.MethodPost, "/payments", "alice", key, body)
-	if retry.StatusCode != http.StatusCreated || retry.Header.Get("Idempotent-Replayed") != "true" || retryBody != firstBody {
-		t.Fatalf("retry: %d replayed=%q %s", retry.StatusCode, retry.Header.Get("Idempotent-Replayed"), retryBody)
-	}
-
-	changed, changedBody := do(http.MethodPost, "/payments", "alice", key, `{"amount":2999,"currency":"EUR"}`)
-	if changed.StatusCode != http.StatusUnprocessableEntity || changed.Header.Get("Content-Type") != "application/problem+json" {
-		t.Fatalf("changed body: %d %s", changed.StatusCode, changedBody)
-	}
-
-	missing, _ := do(http.MethodPost, "/payments", "alice", "", body)
-	if missing.StatusCode != http.StatusBadRequest {
-		t.Fatalf("missing key: %d", missing.StatusCode)
-	}
-
-	bare, _ := do(http.MethodPost, "/payments", "alice", "3f1c2a9e-0b7d-4c55-9e0e-5d6b8a7c4f21", body)
-	if bare.StatusCode != http.StatusBadRequest {
-		t.Fatalf("unquoted key: %d, want 400", bare.StatusCode)
-	}
-
-	// The same key from another account is a different key.
-	bob, bobBody := do(http.MethodPost, "/payments", "bob", key, body)
-	if bob.StatusCode != http.StatusCreated || bob.Header.Get("Idempotent-Replayed") != "" || !strings.Contains(bobBody, `"pay_2"`) {
-		t.Fatalf("bob: %d %s", bob.StatusCode, bobBody)
-	}
-
-	invalid, _ := do(http.MethodPost, "/payments", "alice", `"bad-request-1"`, `{"amount":-5,"currency":"EUR"}`)
-	invalidRetry, _ := do(http.MethodPost, "/payments", "alice", `"bad-request-1"`, `{"amount":-5,"currency":"EUR"}`)
-	if invalid.StatusCode != http.StatusBadRequest || invalidRetry.Header.Get("Idempotent-Replayed") != "true" {
-		t.Fatalf("4xx responses are stored and replayed by default: %d, replayed=%q", invalid.StatusCode, invalidRetry.Header.Get("Idempotent-Replayed"))
-	}
-
-	_, listBody := do(http.MethodGet, "/payments", "alice", "", "")
-	var payments []payment
-	if err := json.Unmarshal([]byte(listBody), &payments); err != nil {
-		t.Fatal(err)
-	}
-	if len(payments) != 1 || payments[0].IdempotencyKey != "3f1c2a9e-0b7d-4c55-9e0e-5d6b8a7c4f21" {
-		t.Fatalf("alice's payments = %+v, want exactly one", payments)
-	}
-
-	if got, _ := do(http.MethodGet, "/payments/pay_2", "alice", "", ""); got.StatusCode != http.StatusNotFound {
-		t.Errorf("alice can read bob's payment: %d", got.StatusCode)
-	}
-	if got, _ := do(http.MethodGet, "/payments/pay_1", "alice", "", ""); got.StatusCode != http.StatusOK {
-		t.Errorf("get own payment: %d", got.StatusCode)
-	}
-	if got, _ := do(http.MethodPost, "/payments", "", key, body); got.StatusCode != http.StatusUnauthorized {
-		t.Errorf("unauthenticated: %d", got.StatusCode)
-	}
-	if got, _ := do(http.MethodPost, "/payments", "alice", `"bad-json"`, `{"amount":`); got.StatusCode != http.StatusBadRequest {
-		t.Errorf("bad JSON: %d", got.StatusCode)
-	}
+	// Not in the README.
+	invalid := `{"amount":-5,"currency":"EUR"}`
+	want("validation error", do(http.MethodPost, posts, "alice", `"bad-request-1"`, invalid), response{status: 400})
+	want("validation error is stored", do(http.MethodPost, posts, "alice", `"bad-request-1"`, invalid), response{status: 400, replayed: "true"})
+	want("bad JSON", do(http.MethodPost, posts, "alice", `"bad-json"`, `{"amount":`), response{status: 400})
+	want("other account's payment", do(http.MethodGet, "/payments/pay_3", "alice", "", ""), response{status: 404})
+	want("own payment", do(http.MethodGet, "/payments/pay_1", "alice", "", ""), response{status: 200, body: pay1 + "\n"})
+	want("unauthenticated", do(http.MethodPost, posts, "", keyA, body), response{status: 401})
 }
 
 // TestInFlightConflict runs on a virtual clock (testing/synctest), so the
