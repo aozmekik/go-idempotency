@@ -18,10 +18,10 @@
 //   - the original request is still in flight (409),
 //   - the key was used before for a request with a different fingerprint (422).
 //
-// Requests are compared by fingerprint: a SHA-256 over the method, path,
-// query, selected headers and the SHA-256 of the body. In-flight requests
-// hold a lock with a lease that is renewed while the handler runs, so a
-// crashed process cannot block a key for longer than one lease.
+// Requests are compared by fingerprint: a SHA-256 over the method, host,
+// path, query, selected headers and the SHA-256 of the body. In-flight
+// requests hold a lock with a lease that is renewed while the handler runs,
+// so a crashed process cannot block a key for longer than one lease.
 //
 // Records live in a [Store]. The memstore package provides an in-process
 // store; Redis and PostgreSQL stores are separate modules

@@ -158,6 +158,8 @@ func TestNewValidatesConfig(t *testing.T) {
 		{"sub-millisecond lease", idempotency.Config{Store: store, Lease: time.Microsecond}, "Lease"},
 		{"negative TTL", idempotency.Config{Store: store, TTL: -time.Second}, "TTL"},
 		{"bad fingerprint header", idempotency.Config{Store: store, FingerprintHeaders: []string{"a b"}}, "fingerprint header"},
+		{"host as fingerprint header", idempotency.Config{Store: store, FingerprintHeaders: []string{"host"}}, "Host is always part"},
+		{"hop-by-hop fingerprint header", idempotency.Config{Store: store, FingerprintHeaders: []string{"Connection"}}, "cannot be fingerprinted"},
 		{"bad replay header", idempotency.Config{Store: store, ReplayHeaders: []string{"a:b"}}, "invalid replay header"},
 		{"hop-by-hop replay header", idempotency.Config{Store: store, ReplayHeaders: []string{"transfer-encoding"}}, "hop-by-hop"},
 		{"content-length replay header", idempotency.Config{Store: store, ReplayHeaders: []string{"Content-Length"}}, "Content-Length"},
@@ -421,6 +423,30 @@ func TestKeyReusedWithDifferentRequest(t *testing.T) {
 		changed.header = http.Header{"X-Tenant": {"a"}, "User-Agent": {"retry-client/2"}}
 		wantReplay(t, serve(mw, changed), http.StatusCreated, first.Body.String())
 	})
+}
+
+// TestHostIsPartOfRequestIdentity wraps a mux that serves two virtual hosts
+// with one middleware and one store. A key reused across the hosts is a
+// different request (422), never a replay of the other host's response.
+func TestHostIsPartOfRequestIdentity(t *testing.T) {
+	t.Parallel()
+	mux := http.NewServeMux()
+	for _, host := range []string{"api.example.com", "sandbox.api.example.com"} {
+		mux.HandleFunc("POST "+host+"/charges", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte("served by " + host))
+		})
+	}
+	mw := newMiddleware(t, idempotency.Config{}).Handler(mux)
+	sandbox := serve(mw, request{target: "http://sandbox.api.example.com/charges", key: testKey, body: "{}"})
+	if sandbox.Body.String() != "served by sandbox.api.example.com" {
+		t.Fatalf("sandbox: %d %q", sandbox.Code, sandbox.Body)
+	}
+	wantProblem(t, serve(mw, request{target: "http://api.example.com/charges", key: testKey, body: "{}"}),
+		http.StatusUnprocessableEntity, idempotency.ProblemKeyReused)
+	// Host names are case-insensitive.
+	wantReplay(t, serve(mw, request{target: "http://SANDBOX.api.example.com/charges", key: testKey, body: "{}"}),
+		http.StatusCreated, "served by sandbox.api.example.com")
 }
 
 func TestReusedKeyWhileInFlightIsStillAMismatch(t *testing.T) {

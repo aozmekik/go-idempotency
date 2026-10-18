@@ -78,7 +78,9 @@ type Config struct {
 	Scope func(*http.Request) string
 
 	// FingerprintHeaders lists request header fields that are part of the
-	// fingerprint in addition to the method, path, query and body.
+	// fingerprint in addition to the method, host, path, query and body.
+	// Host is always included and cannot be listed; neither can hop-by-hop
+	// fields, which describe one connection rather than the request.
 	// Default: none.
 	FingerprintHeaders []string
 
@@ -195,10 +197,17 @@ func New(cfg Config) (*Middleware, error) {
 	}
 
 	for _, name := range cfg.FingerprintHeaders {
-		if !isToken(name) {
+		canonical := http.CanonicalHeaderKey(name)
+		switch {
+		case !isToken(name):
 			return nil, fmt.Errorf("idempotency: invalid fingerprint header %q", name)
+		case canonical == "Host":
+			// net/http moves Host out of Request.Header into Request.Host.
+			return nil, errors.New("idempotency: Host is always part of the fingerprint and cannot be listed")
+		case slices.Contains(hopByHop, canonical):
+			return nil, fmt.Errorf("idempotency: hop-by-hop header %q cannot be fingerprinted", name)
 		}
-		m.fpHeaders = append(m.fpHeaders, http.CanonicalHeaderKey(name))
+		m.fpHeaders = append(m.fpHeaders, canonical)
 	}
 	slices.Sort(m.fpHeaders)
 	m.fpHeaders = slices.Compact(m.fpHeaders)
