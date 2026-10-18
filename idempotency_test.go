@@ -908,31 +908,48 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// faultyStore wraps a Store and injects failures.
+// faultyStore wraps a Store and injects failures. The error fields make a
+// method fail without reaching the store. The hooks, when set, run in place
+// of a method and may call next to delegate; n counts the method's calls
+// from 1.
 type faultyStore struct {
 	idempotency.Store
 	acquireErr  error
 	completeErr error
 	releaseErr  error
-	extendErr   func(n int) error // n counts calls from 1; nil error delegates
-	extendCalls atomic.Int32
+
+	onAcquire  func(ctx context.Context, n int, next func() (idempotency.Acquisition, error)) (idempotency.Acquisition, error)
+	onExtend   func(ctx context.Context, n int, next func() error) error
+	onComplete func(ctx context.Context, next func() error) error
+
+	acquireCalls, extendCalls, releaseCalls atomic.Int32
 }
 
 func (f *faultyStore) Acquire(ctx context.Context, key, token string, fp idempotency.Fingerprint, lease time.Duration) (idempotency.Acquisition, error) {
+	n := int(f.acquireCalls.Add(1))
 	if f.acquireErr != nil {
 		return idempotency.Acquisition{}, f.acquireErr
 	}
-	return f.Store.Acquire(ctx, key, token, fp, lease)
+	next := func() (idempotency.Acquisition, error) { return f.Store.Acquire(ctx, key, token, fp, lease) }
+	if f.onAcquire != nil {
+		return f.onAcquire(ctx, n, next)
+	}
+	return next()
 }
 
 func (f *faultyStore) Complete(ctx context.Context, key, token string, resp *idempotency.Response, ttl time.Duration) error {
 	if f.completeErr != nil {
 		return f.completeErr
 	}
-	return f.Store.Complete(ctx, key, token, resp, ttl)
+	next := func() error { return f.Store.Complete(ctx, key, token, resp, ttl) }
+	if f.onComplete != nil {
+		return f.onComplete(ctx, next)
+	}
+	return next()
 }
 
 func (f *faultyStore) Release(ctx context.Context, key, token string) error {
+	f.releaseCalls.Add(1)
 	if f.releaseErr != nil {
 		return f.releaseErr
 	}
@@ -941,12 +958,18 @@ func (f *faultyStore) Release(ctx context.Context, key, token string) error {
 
 func (f *faultyStore) Extend(ctx context.Context, key, token string, lease time.Duration) error {
 	n := int(f.extendCalls.Add(1))
-	if f.extendErr != nil {
-		if err := f.extendErr(n); err != nil {
-			return err
-		}
+	next := func() error { return f.Store.Extend(ctx, key, token, lease) }
+	if f.onExtend != nil {
+		return f.onExtend(ctx, n, next)
 	}
-	return f.Store.Extend(ctx, key, token, lease)
+	return next()
+}
+
+// hang blocks until ctx is done, like a store call stuck on a dead
+// connection, and returns the context's error.
+func hang(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func newFaulty(t *testing.T, f *faultyStore) (*faultyStore, *slog.Logger, *syncBuffer) {
