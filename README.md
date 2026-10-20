@@ -66,10 +66,9 @@ go get github.com/aozmekik/go-idempotency/redisstore # Redis store
 go get github.com/aozmekik/go-idempotency/pgstore    # PostgreSQL store
 ```
 
-Not yet published to the Go module proxy. Once the repository is public, the first command works and
-resolves a pseudo-version of `main`. The store modules can only be installed after the `v0.1.0`,
-`redisstore/v0.1.0` and `pgstore/v0.1.0` tags are pushed, because each one requires a tagged core
-version ([CONTRIBUTING.md](CONTRIBUTING.md#releasing)).
+The Redis and PostgreSQL stores are separate modules, tagged together with the core module
+(`v0.1.0`, `redisstore/v0.1.0`, `pgstore/v0.1.0`; see
+[CONTRIBUTING.md](CONTRIBUTING.md#releasing)).
 
 ## Quick start
 
