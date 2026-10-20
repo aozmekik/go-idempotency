@@ -10,7 +10,7 @@ Before 1.0.0, minor versions may contain breaking changes.
 
 ## [0.1.0] - 2026-10-18
 
-First release. Not yet tagged or published.
+First release.
 
 ### Added
 
