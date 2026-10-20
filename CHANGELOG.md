@@ -37,3 +37,6 @@ First release.
 - `pgstore` module: PostgreSQL store using pgx v5, with `schema.sql`, `Migrate` (safe to run
   from several instances at once) and `DeleteExpired`.
 - `examples/payments`: demo API with a curl walkthrough.
+
+[Unreleased]: https://github.com/aozmekik/go-idempotency/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/aozmekik/go-idempotency/releases/tag/v0.1.0
